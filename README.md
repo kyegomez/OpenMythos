@@ -8,7 +8,13 @@ OpenMythos is an open-source, theoretical implementation of the Claude Mythos mo
 ## Installation
 
 ```bash
-git clone https://github.com/The-Swarm-Corporation/OpenMythos.git
+pip install git+https://github.com/kyegomez/OpenMythos.git
+```
+
+For contributors who want to work from source:
+
+```bash
+git clone https://github.com/kyegomez/OpenMythos.git
 cd OpenMythos
 pip install -r requirements.txt
 ```

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-mythos"
+version = "0.1.0"
+description = "Open-source, theoretical implementation of the Claude Mythos model"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Kye Gomez" }]
+dependencies = [
+    "torch>=2.1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kyegomez/OpenMythos"
+Repository = "https://github.com/kyegomez/OpenMythos"
+Issues = "https://github.com/kyegomez/OpenMythos/issues"
+
+[tool.setuptools.packages.find]
+include = ["open_mythos*"]
