@@ -1110,9 +1110,22 @@ class OpenMythosForCausalLM(PreTrainedModel):
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
+        past_key_values: Optional[dict] = None,
         **kwargs
     ) -> CausalLMOutputWithPast:
-        logits = self.model(input_ids, n_loops=n_loops)
+        # Determine start_pos automatically if KV cache is in use 
+        start_pos = 0
+        if past_key_values is not None:
+            # We find the shape of the past values to determine length
+            first_key = next(iter(past_key_values.keys()))
+            if "k" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["k"].shape[1]
+            elif "c_kv" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["c_kv"].shape[1]
+        
+        # We reuse past_key_values directly as kwargs kv_cache
+        kv_cache = past_key_values if past_key_values is not None else {}
+        logits = self.model(input_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
         
         loss = None
         if labels is not None:
@@ -1128,6 +1141,7 @@ class OpenMythosForCausalLM(PreTrainedModel):
             return CausalLMOutputWithPast(
                 loss=loss,
                 logits=logits,
+                past_key_values=kv_cache,
             )
         else:
             return logits, loss
