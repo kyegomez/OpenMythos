@@ -12,6 +12,14 @@ try:
 except ImportError:
     _HAS_FLASH_ATTN = False
 
+try:
+    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+except ImportError:
+    PretrainedConfig = object
+    PreTrainedModel = object
+    CausalLMOutputWithPast = None
+
 
 @dataclass
 class MythosConfig:
@@ -414,6 +422,7 @@ class MLAttention(nn.Module):
             attn = attn + mask
         attn = self.attn_drop(F.softmax(attn, dim=-1))
         out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -1083,3 +1092,42 @@ class OpenMythos(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
         return input_ids
+
+
+class OpenMythosForCausalLM(PreTrainedModel):
+    """
+    Hugging Face PreTrainedModel wrapper for OpenMythos to enable
+    Trainer API interoperability and easy loading.
+    """
+    config_class = MythosConfig
+    
+    def __init__(self, config: MythosConfig):
+        super().__init__(config)
+        self.model = OpenMythos(config)
+        
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        **kwargs
+    ) -> CausalLMOutputWithPast:
+        logits = self.model(input_ids, n_loops=n_loops)
+        
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
+            )
+            
+        if CausalLMOutputWithPast is not None:
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+            )
+        else:
+            return logits, loss
