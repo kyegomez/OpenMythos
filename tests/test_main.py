@@ -286,6 +286,29 @@ class TestGQAttention:
         out = self.attn(x, self.freqs, mask=mask)
         assert out.shape == (B, T, self.cfg.dim)
 
+    def test_sdpa_equivalence(self):
+        torch.manual_seed(0)
+        cfg = gqa_cfg()
+        cfg.use_sdpa = False
+        attn_manual = GQAttention(cfg)
+        attn_manual.eval()
+        cfg.use_sdpa = True
+        attn_sdpa = GQAttention(cfg)
+        attn_sdpa.eval()
+        attn_sdpa.load_state_dict(attn_manual.state_dict())
+
+        seq_len = 16
+        x = torch.randn(2, seq_len, cfg.dim)
+        freqs = precompute_rope_freqs(
+            cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta
+        )
+        mask = OpenMythos._causal_mask(seq_len, torch.device("cpu"), torch.float32)
+
+        with torch.no_grad():
+            o_manual = attn_manual(x, freqs[:seq_len], mask)
+            o_sdpa = attn_sdpa(x, freqs[:seq_len], mask)
+        assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # MLAttention
@@ -327,6 +350,29 @@ class TestMLAttention:
         mask = torch.triu(torch.full((1, 1, T, T), float("-inf")), diagonal=1)
         out = self.attn(x, self.freqs, mask=mask)
         assert out.shape == (B, T, self.cfg.dim)
+
+    def test_sdpa_equivalence(self):
+        torch.manual_seed(0)
+        cfg = mla_cfg()
+        cfg.use_sdpa = False
+        attn_manual = MLAttention(cfg)
+        attn_manual.eval()
+        cfg.use_sdpa = True
+        attn_sdpa = MLAttention(cfg)
+        attn_sdpa.eval()
+        attn_sdpa.load_state_dict(attn_manual.state_dict())
+
+        seq_len = 16
+        x = torch.randn(2, seq_len, cfg.dim)
+        freqs = precompute_rope_freqs(
+            cfg.qk_rope_head_dim, cfg.max_seq_len, cfg.rope_theta
+        )
+        mask = OpenMythos._causal_mask(seq_len, torch.device("cpu"), torch.float32)
+
+        with torch.no_grad():
+            o_manual = attn_manual(x, freqs[:seq_len], mask)
+            o_sdpa = attn_sdpa(x, freqs[:seq_len], mask)
+        assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
 
 
 # ---------------------------------------------------------------------------

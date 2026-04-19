@@ -46,6 +46,7 @@ class MythosConfig:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
         rope_theta      -- RoPE base frequency
         lora_rank       -- rank of the per-loop depth-wise LoRA adapter
+        use_sdpa        -- if True, use torch.scaled_dot_product_attention backend
     """
 
     vocab_size: int = 32000
@@ -58,6 +59,8 @@ class MythosConfig:
     coda_layers: int = 2
     # Attention type: "gqa" | "mla"
     attn_type: str = "mla"
+    # Attention backend
+    use_sdpa: bool = True  # torch.nn.functional.scaled_dot_product_attention
     # MLA params (only used when attn_type="mla")
     kv_lora_rank: int = 512  # compressed KV latent cached instead of full K/V
     q_lora_rank: int = 1536  # compressed Q latent dim
@@ -202,6 +205,7 @@ class GQAttention(nn.Module):
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
         self.groups = cfg.n_heads // cfg.n_kv_heads
+        self.use_sdpa = cfg.use_sdpa
 
         self.wq = nn.Linear(cfg.dim, cfg.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
@@ -257,20 +261,33 @@ class GQAttention(nn.Module):
             )
             out = out.to(orig_dtype).contiguous().view(B, T, -1)
         else:
-            # Fallback: manual scaled dot-product with explicit KV head expansion.
+            # Fallback: manual scaled dot-product with explicit KV head expansion,
+            # or torch SDPA when use_sdpa is set (picks up Flash/Memory-efficient
+            # kernels on CUDA automatically).
             k = k.repeat_interleave(self.groups, dim=2)
             v = v.repeat_interleave(self.groups, dim=2)
             q = q.transpose(1, 2)  # (B, H, T, head_dim)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            scale = self.head_dim**-0.5
-            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-            if mask is not None:
-                attn = attn + mask
-            attn = F.dropout(
-                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
-            )
-            out = torch.matmul(attn, v)
+            if self.use_sdpa:
+                dropout_p = self.dropout_p if self.training else 0.0
+                out = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=mask,
+                    dropout_p=dropout_p,
+                    is_causal=(mask is None and q.size(-2) > 1),
+                )
+            else:
+                scale = self.head_dim**-0.5
+                attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+                if mask is not None:
+                    attn = attn + mask
+                attn = F.dropout(
+                    F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+                )
+                out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.wo(out)
@@ -322,6 +339,7 @@ class MLAttention(nn.Module):
         self.qk_nope_dim = cfg.qk_nope_head_dim
         self.v_dim = cfg.v_head_dim
         self.q_head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+        self.use_sdpa = cfg.use_sdpa
 
         # Q compression
         self.q_down = nn.Linear(cfg.dim, cfg.q_lora_rank, bias=False)
@@ -408,12 +426,23 @@ class MLAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        if self.use_sdpa:
+            dropout_p = self.attn_drop.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=dropout_p,
+                is_causal=(mask is None and q.size(-2) > 1),
+            )
+        else:
+            scale = self.q_head_dim**-0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if mask is not None:
+                attn = attn + mask
+            attn = self.attn_drop(F.softmax(attn, dim=-1))
+            out = torch.matmul(attn, v)  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
