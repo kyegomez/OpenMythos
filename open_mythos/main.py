@@ -11,13 +11,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+except ImportError:
+    PretrainedConfig = object
+    PreTrainedModel = object
+    CausalLMOutputWithPast = None
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class MythosConfig:
+class MythosConfig(PretrainedConfig):
     """
     Hyperparameter configuration for OpenMythos.
 
@@ -51,33 +58,55 @@ class MythosConfig:
         lora_rank       -- rank of the per-loop depth-wise LoRA adapter
     """
 
-    vocab_size: int = 32000
-    dim: int = 2048
-    n_heads: int = 16
-    n_kv_heads: int = 4  # GQA: fewer KV heads than Q heads
-    max_seq_len: int = 4096
-    max_loop_iters: int = 16  # T — recurrent depth at inference
-    prelude_layers: int = 2
-    coda_layers: int = 2
-    # Attention type: "gqa" | "mla"
-    attn_type: str = "mla"
-    # MLA params (only used when attn_type="mla")
-    kv_lora_rank: int = 512  # compressed KV latent cached instead of full K/V
-    q_lora_rank: int = 1536  # compressed Q latent dim
-    qk_rope_head_dim: int = 64  # per-head dims that receive RoPE
-    qk_nope_head_dim: int = 128  # per-head dims without RoPE
-    v_head_dim: int = 128  # per-head value dim
-    # MoE
-    n_experts: int = 64
-    n_shared_experts: int = 2
-    n_experts_per_tok: int = 4  # top-K routed
-    expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
-    # ACT halting
-    act_threshold: float = 0.99
-    # RoPE
-    rope_theta: float = 500000.0
-    # LoRA depth adaptation
-    lora_rank: int = 16
+    model_type = "open_mythos"
+
+    def __init__(
+        self,
+        vocab_size: int = 32000,
+        dim: int = 2048,
+        n_heads: int = 16,
+        n_kv_heads: int = 4,
+        max_seq_len: int = 4096,
+        max_loop_iters: int = 16,
+        prelude_layers: int = 2,
+        coda_layers: int = 2,
+        attn_type: str = "mla",
+        kv_lora_rank: int = 512,
+        q_lora_rank: int = 1536,
+        qk_rope_head_dim: int = 64,
+        qk_nope_head_dim: int = 128,
+        v_head_dim: int = 128,
+        n_experts: int = 64,
+        n_shared_experts: int = 2,
+        n_experts_per_tok: int = 4,
+        expert_dim: int = 512,
+        act_threshold: float = 0.99,
+        rope_theta: float = 500000.0,
+        lora_rank: int = 16,
+        **kwargs
+    ):
+        self.vocab_size = vocab_size
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.max_seq_len = max_seq_len
+        self.max_loop_iters = max_loop_iters
+        self.prelude_layers = prelude_layers
+        self.coda_layers = coda_layers
+        self.attn_type = attn_type
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.v_head_dim = v_head_dim
+        self.n_experts = n_experts
+        self.n_shared_experts = n_shared_experts
+        self.n_experts_per_tok = n_experts_per_tok
+        self.expert_dim = expert_dim
+        self.act_threshold = act_threshold
+        self.rope_theta = rope_theta
+        self.lora_rank = lora_rank
+        super().__init__(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -153,13 +182,13 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (max_len, head_dim//2)
+        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[: x.shape[1]].unsqueeze(0).unsqueeze(2)
+    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
     return torch.view_as_real(xc * freqs_cis).flatten(-2).to(x.dtype)
 
 
@@ -238,12 +267,11 @@ class GQAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            is_causal=False
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -379,12 +407,11 @@ class MLAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            is_causal=False
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -937,6 +964,7 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -947,6 +975,7 @@ class OpenMythos(nn.Module):
                          Increase at inference to extrapolate to harder problems.
             kv_cache  -- dict mutated in-place for autoregressive KV caching;
                          pass an empty dict {} and reuse across decode steps
+            start_pos -- Starting position index for RoPE. Used during decoding.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -957,7 +986,7 @@ class OpenMythos(nn.Module):
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
+        )[start_pos:start_pos + T]
         mask = self._causal_mask(T, device) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
@@ -1003,8 +1032,9 @@ class OpenMythos(nn.Module):
         """
         kv_cache: dict = {}
         for step in range(max_new_tokens):
+            start_pos = 0 if step == 0 else input_ids.shape[1] - 1
             cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)
@@ -1013,3 +1043,56 @@ class OpenMythos(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
         return input_ids
+
+
+class OpenMythosForCausalLM(PreTrainedModel):
+    """
+    Hugging Face PreTrainedModel wrapper for OpenMythos to enable
+    Trainer API interoperability and easy loading.
+    """
+    config_class = MythosConfig
+    
+    def __init__(self, config: MythosConfig):
+        super().__init__(config)
+        self.model = OpenMythos(config)
+        
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        past_key_values: Optional[dict] = None,
+        **kwargs
+    ) -> CausalLMOutputWithPast:
+        # Determine start_pos automatically if KV cache is in use 
+        start_pos = 0
+        if past_key_values is not None:
+            # We find the shape of the past values to determine length
+            first_key = next(iter(past_key_values.keys()))
+            if "k" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["k"].shape[1]
+            elif "c_kv" in past_key_values[first_key]:
+                start_pos = past_key_values[first_key]["c_kv"].shape[1]
+        
+        # We reuse past_key_values directly as kwargs kv_cache
+        kv_cache = past_key_values if past_key_values is not None else {}
+        logits = self.model(input_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
+        
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
+            )
+            
+        if CausalLMOutputWithPast is not None:
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=kv_cache,
+            )
+        else:
+            return logits, loss
