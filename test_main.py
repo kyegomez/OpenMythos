@@ -374,6 +374,16 @@ class TestMoEFFN:
         out = self.moe(x)
         assert out.abs().sum() > 0
 
+    def test_routing_diagnostics_are_updated(self):
+        x = torch.randn(B, T, self.cfg.dim)
+        _ = self.moe(x)
+        assert torch.isfinite(self.moe.last_load_balance_loss)
+        assert torch.isclose(
+            self.moe.last_expert_load.sum(),
+            torch.tensor(1.0, device=self.moe.last_expert_load.device),
+            atol=1e-6,
+        )
+
 
 # ---------------------------------------------------------------------------
 # loop_index_embedding
