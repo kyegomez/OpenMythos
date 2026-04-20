@@ -38,7 +38,9 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-torch = "*"
+torch = "2.11.0"
+transformers = ">=4.40.0"
+datasets = ">=2.18.0"
 
 
 [tool.poetry.group.lint.dependencies]

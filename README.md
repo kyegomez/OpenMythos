@@ -106,6 +106,34 @@ print(f"Parameters: {total:,}")
 
 ---
 
+## Training
+
+The training script for the 3B model on FineWeb-Edu is at [`training/3b_fine_web_edu.py`](training/3b_fine_web_edu.py).
+
+**Single GPU:**
+```bash
+python training/3b_fine_web_edu.py
+```
+
+**Multi-GPU (auto-detects GPU count):**
+```bash
+torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
+```
+
+Key design choices:
+
+| Feature | Detail |
+|---|---|
+| Optimizer | Muon for 2D weight matrices, AdamW for embeddings/norms |
+| Dataset | `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default, swap to `sample-100BT` or `default` for full run) |
+| Tokenizer | `openai/gpt-oss-20b` via `MythosTokenizer` |
+| Parallelism | PyTorch DDP via `torchrun`, sharded streaming dataset |
+| Precision | bfloat16 on H100/A100, float16 + GradScaler on older GPUs |
+| Schedule | Linear warmup (2000 steps) → cosine decay |
+| Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
+
+---
+
 ## Documentation
 
 | Page | Description |
