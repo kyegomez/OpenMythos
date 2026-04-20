@@ -542,6 +542,53 @@ class TestRecurrentBlock:
         out = self.block(h, e, self.freqs, n_loops=1)
         assert out.shape == (B, T, self.cfg.dim)
 
+    def test_halted_positions_stop_contributing(self):
+        cfg = gqa_cfg(dim=8, n_heads=2, n_kv_heads=1, max_loop_iters=2, act_threshold=0.75)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+
+        class ScriptedTransformer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.step = 0
+
+            def forward(self, x, freqs_cis, mask=None, kv_cache=None, cache_key="default"):
+                self.step += 1
+                return torch.full_like(x, float(self.step))
+
+        class ScriptedACT(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.step = 0
+
+            def forward(self, h):
+                self.step += 1
+                if self.step == 1:
+                    return torch.tensor([[0.8, 0.4]], device=h.device, dtype=h.dtype)
+                return torch.tensor([[0.8, 0.4]], device=h.device, dtype=h.dtype)
+
+        class PassInjection(torch.nn.Module):
+            def forward(self, h, e, transformer_out):
+                return transformer_out
+
+        class ZeroLoRA(torch.nn.Module):
+            def forward(self, x, loop_t):
+                return torch.zeros_like(x)
+
+        block.block = ScriptedTransformer()
+        block.act = ScriptedACT()
+        block.injection = PassInjection()
+        block.lora = ZeroLoRA()
+
+        h0 = torch.zeros(1, 2, cfg.dim)
+        e0 = torch.zeros(1, 2, cfg.dim)
+        out = block(h0, e0, freqs, n_loops=2)
+
+        # Token 0 halts at loop 1 and should not accumulate loop-2 output.
+        assert torch.allclose(out[0, 0], torch.ones(cfg.dim), atol=1e-6)
+        # Token 1 keeps contributing and gets weighted sum: 0.4 * 1 + 0.6 * 2 = 1.6.
+        assert torch.allclose(out[0, 1], torch.full((cfg.dim,), 1.6), atol=1e-6)
+
 
 # ---------------------------------------------------------------------------
 # OpenMythos — GQA mode

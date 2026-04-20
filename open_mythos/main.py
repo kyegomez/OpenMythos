@@ -826,10 +826,13 @@ class RecurrentBlock(nn.Module):
             # ACT remainder trick: once cumulative_p + p crosses threshold,
             # assign the remaining probability mass as the final weight
             remainder = (1.0 - cumulative_p).clamp(min=0)
+            crossing = still_running & (
+                cumulative_p + p >= self.cfg.act_threshold
+            )
             weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
+                crossing,
                 remainder,
-                p,
+                p * still_running.float(),
             )
             h_out = h_out + weight.unsqueeze(-1) * h
 
