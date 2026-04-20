@@ -114,7 +114,7 @@ from open_mythos import (
     OpenMythos,
 )
 
-cfg = mythos_7b()  # returns a MythosConfig
+cfg = mythos_3b()  # returns a MythosConfig
 model = OpenMythos(cfg)
 
 total = sum(p.numel() for p in model.parameters())
