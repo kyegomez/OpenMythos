@@ -572,7 +572,8 @@ class LoRAAdapter(nn.Module):
         Returns:
             Delta tensor of shape (B, T, dim) to be added to the block output
         """
-        s = self.scale(torch.tensor(loop_t, device=x.device))  # (rank,)
+        idx = min(loop_t, self.scale.num_embeddings - 1)  # clamp for depth extrapolation
+        s = self.scale(torch.tensor(idx, device=x.device))  # (rank,)
         down = self.down(x) * s  # (B, T, rank)
         return down @ self.B  # (B, T, dim)
 
