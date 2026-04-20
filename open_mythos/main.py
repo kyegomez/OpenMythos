@@ -147,14 +147,19 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (max_len, head_dim//2)
+        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2),
+                     already sliced to exactly the positions being processed
+                     (caller is responsible for correct start_pos offset)
 
     Returns:
         Rotated tensor of the same shape and dtype as x
     """
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[: x.shape[1]].unsqueeze(0).unsqueeze(2)
-    return torch.view_as_real(xc * freqs_cis).flatten(-2).to(x.dtype)
+    return (
+        torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
+        .flatten(-2)
+        .to(x.dtype)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +941,7 @@ class OpenMythos(nn.Module):
         input_ids: torch.Tensor,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        start_pos: int = 0,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
@@ -946,17 +952,21 @@ class OpenMythos(nn.Module):
                          Increase at inference to extrapolate to harder problems.
             kv_cache  -- dict mutated in-place for autoregressive KV caching;
                          pass an empty dict {} and reuse across decode steps
+            start_pos -- index of the first token in input_ids within the full
+                         sequence; used to select the correct RoPE frequencies
+                         during incremental decoding (0 for prefill, prompt_len
+                         for each subsequent decode step)
 
         Returns:
             Logits of shape (B, T, vocab_size)
         """
-        B, T = input_ids.shape
+        T = input_ids.shape[1]
         device = input_ids.device
 
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
+        )[start_pos : start_pos + T]
         mask = self._causal_mask(T, device) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
@@ -1001,9 +1011,17 @@ class OpenMythos(nn.Module):
             Token indices of shape (B, T + max_new_tokens)
         """
         kv_cache: dict = {}
+        prompt_len = input_ids.shape[1]
         for step in range(max_new_tokens):
-            cur_ids = input_ids if step == 0 else input_ids[:, -1:]
-            logits = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache)
+            if step == 0:
+                cur_ids = input_ids
+                start_pos = 0
+            else:
+                cur_ids = input_ids[:, -1:]
+                start_pos = prompt_len + step - 1
+            logits = self.forward(
+                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+            )
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)

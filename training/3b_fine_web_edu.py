@@ -113,7 +113,9 @@ def main():
     master = rank == 0
 
     if master:
-        print(f"GPUs: {torch.cuda.device_count()}  |  World size: {world_size}  |  Device: {device}")
+        print(
+            f"GPUs: {torch.cuda.device_count()}  |  World size: {world_size}  |  Device: {device}"
+        )
 
     # ------------------------------------------------------------------
     # Tokenizer
