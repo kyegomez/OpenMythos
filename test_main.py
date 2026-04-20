@@ -595,6 +595,18 @@ class TestOpenMythosGQA:
         logits = self.model(single)
         assert logits.shape == (B, 1, self.cfg.vocab_size)
 
+    def test_cached_chunk_logits_match_full_forward(self):
+        model = self.model.eval()
+        ids = torch.randint(0, self.cfg.vocab_size, (1, 6))
+
+        with torch.no_grad():
+            full_logits = model(ids, n_loops=2)
+            cache = {}
+            model(ids[:, :4], n_loops=2, kv_cache=cache)
+            chunk_logits = model(ids[:, 4:], n_loops=2, kv_cache=cache)
+
+        assert torch.allclose(chunk_logits, full_logits[:, 4:, :], atol=1e-4)
+
 
 # ---------------------------------------------------------------------------
 # OpenMythos — MLA mode
@@ -632,6 +644,18 @@ class TestOpenMythosMLА:
         assert len(mla_entries) > 0
         for entry in mla_entries.values():
             assert entry["c_kv"].shape[-1] == self.cfg.kv_lora_rank
+
+    def test_cached_chunk_logits_match_full_forward(self):
+        model = self.model.eval()
+        ids = torch.randint(0, self.cfg.vocab_size, (1, 6))
+
+        with torch.no_grad():
+            full_logits = model(ids, n_loops=2)
+            cache = {}
+            model(ids[:, :4], n_loops=2, kv_cache=cache)
+            chunk_logits = model(ids[:, 4:], n_loops=2, kv_cache=cache)
+
+        assert torch.allclose(chunk_logits, full_logits[:, 4:, :], atol=1e-4)
 
 
 # ---------------------------------------------------------------------------

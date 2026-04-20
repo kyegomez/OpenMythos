@@ -917,19 +917,40 @@ class OpenMythos(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
 
     @staticmethod
-    def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    def _causal_mask(
+        query_len: int, key_len: int, cache_offset: int, device: torch.device
+    ) -> torch.Tensor:
         """
-        Build an additive causal mask: 0 on and below the diagonal, -inf above.
+        Build an additive causal mask for cached and non-cached decoding.
 
         Args:
-            seq_len -- sequence length
-            device  -- target device
+            query_len    -- number of query tokens processed in this forward call
+            key_len      -- total number of key tokens (cache + current chunk)
+            cache_offset -- number of cached tokens before the current chunk
+            device       -- target device
 
         Returns:
-            Tensor of shape (1, 1, seq_len, seq_len) broadcastable over (B, H, T, S)
+            Tensor of shape (1, 1, query_len, key_len) broadcastable over (B, H, T, S)
         """
-        mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device)
-        return torch.triu(mask, diagonal=1)
+        q_pos = torch.arange(query_len, device=device).unsqueeze(1) + cache_offset
+        k_pos = torch.arange(key_len, device=device).unsqueeze(0)
+        allowed = k_pos <= q_pos
+        mask = torch.zeros((query_len, key_len), device=device)
+        mask = mask.masked_fill(~allowed, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    @staticmethod
+    def _cache_len(kv_cache: Optional[dict]) -> int:
+        """Infer cached sequence length from any existing cache entry."""
+        if not kv_cache:
+            return 0
+
+        for entry in kv_cache.values():
+            if "k" in entry:
+                return int(entry["k"].shape[1])
+            if "c_kv" in entry:
+                return int(entry["c_kv"].shape[1])
+        return 0
 
     def forward(
         self,
@@ -952,12 +973,14 @@ class OpenMythos(nn.Module):
         """
         B, T = input_ids.shape
         device = input_ids.device
+        cache_offset = self._cache_len(kv_cache)
+        key_len = cache_offset + T
 
         x = self.embed(input_ids)
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
-        )[:T]
-        mask = self._causal_mask(T, device) if T > 1 else None
+        )[cache_offset:key_len]
+        mask = self._causal_mask(T, key_len, cache_offset, device) if key_len > 1 else None
 
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
