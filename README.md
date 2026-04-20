@@ -151,12 +151,13 @@ Key design choices:
 
 | Feature | Detail |
 |---|---|
-| Optimizer | Muon for 2D weight matrices, AdamW for embeddings/norms |
+| Optimizer | AdamW |
 | Dataset | `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default, swap to `sample-100BT` or `default` for full run) |
 | Tokenizer | `openai/gpt-oss-20b` via `MythosTokenizer` |
 | Parallelism | PyTorch DDP via `torchrun`, sharded streaming dataset |
-| Precision | bfloat16 on H100/A100, float16 + GradScaler on older GPUs |
+| Precision | bfloat16 when supported; float16 + GradScaler on single-GPU older cards |
 | Schedule | Linear warmup (2000 steps) → cosine decay |
+| Validation | Periodic val loss + perplexity reporting during training |
 | Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
 
 ---
