@@ -243,7 +243,7 @@ class GQAttention(nn.Module):
         if mask is not None:
             attn = attn + mask
         attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn.to(v.dtype), v)  # softmax may upcast under bf16 AMP; align with v
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -385,7 +385,7 @@ class MLAttention(nn.Module):
         if mask is not None:
             attn = attn + mask
         attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        out = torch.matmul(attn.to(v.dtype), v)  # (B, H, T, v_dim); softmax may upcast under bf16 AMP
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -487,16 +487,25 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
+        # Routed expert dispatch: flatten (token, slot) pairs so a single outer
+        # loop over experts handles every pair routed to that expert at once.
+        # Original was nested topk × n_experts with per-slot masking; this is
+        # mathematically identical (topk returns distinct experts per token, so
+        # a given token appears at most once per expert across all slots) but
+        # halves iterations at topk=2 and drops them 4x at topk=4 / 64 experts.
+        N = B * T
+        flat_expert = topk_idx.reshape(-1)  # (N*K,)
+        flat_token = torch.arange(N, device=x.device).repeat_interleave(self.topk)  # (N*K,)
+        flat_weight = topk_scores.reshape(-1, 1)  # (N*K, 1)
+
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        for eid in range(self.n_experts):
+            sel = flat_expert == eid
+            if not sel.any():
+                continue
+            tok = flat_token[sel]
+            expert_out = self.routed_experts[eid](flat[tok]) * flat_weight[sel]
+            out.index_add_(0, tok, expert_out)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
@@ -823,7 +832,11 @@ class RecurrentBlock(nn.Module):
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
-        cumulative_p = torch.zeros(B, T, device=h.device)
+        # Match h's dtype so the ACT weight accumulation into h_out stays in
+        # the activation dtype (bf16 under FSDP MixedPrecision) — a naive
+        # fp32 cumulative_p silently promotes h_out via broadcasting and
+        # feeds fp32 into the coda's bf16 Linear layers.
+        cumulative_p = torch.zeros(B, T, device=h.device, dtype=h.dtype)
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
@@ -848,10 +861,10 @@ class RecurrentBlock(nn.Module):
                 remainder,
                 p,
             )
-            weight = weight * still_running.float()
+            weight = weight * still_running.to(h.dtype)
             h_out = h_out + weight.unsqueeze(-1) * h
 
-            cumulative_p = cumulative_p + p * still_running.float()
+            cumulative_p = cumulative_p + p * still_running.to(h.dtype)
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
             # Only short-circuit when there is no KV cache to keep consistent.
