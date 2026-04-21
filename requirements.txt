@@ -1,4 +1,9 @@
-torch>=2.1.0
-transformers>=4.40.0
-datasets>=2.18.0
-pytest>=7.0.0
+# Runtime requirements for using `open_mythos` as a library.
+# These are broad ranges; a training run should use training/requirements.txt,
+# which pins exact versions for reproducibility across nodes.
+torch>=2.3.0,<3.0.0
+transformers>=4.40.0,<5.0.0
+datasets>=2.18.0,<4.0.0
+
+# dev / test tooling
+pytest>=8.1.1,<10.0.0
