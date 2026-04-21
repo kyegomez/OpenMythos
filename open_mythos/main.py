@@ -487,16 +487,25 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
+        # Routed expert dispatch: flatten (token, slot) pairs so a single outer
+        # loop over experts handles every pair routed to that expert at once.
+        # Original was nested topk × n_experts with per-slot masking; this is
+        # mathematically identical (topk returns distinct experts per token, so
+        # a given token appears at most once per expert across all slots) but
+        # halves iterations at topk=2 and drops them 4x at topk=4 / 64 experts.
+        N = B * T
+        flat_expert = topk_idx.reshape(-1)  # (N*K,)
+        flat_token = torch.arange(N, device=x.device).repeat_interleave(self.topk)  # (N*K,)
+        flat_weight = topk_scores.reshape(-1, 1)  # (N*K, 1)
+
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        for eid in range(self.n_experts):
+            sel = flat_expert == eid
+            if not sel.any():
+                continue
+            tok = flat_token[sel]
+            expert_out = self.routed_experts[eid](flat[tok]) * flat_weight[sel]
+            out.index_add_(0, tok, expert_out)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
