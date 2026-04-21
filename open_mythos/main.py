@@ -243,7 +243,7 @@ class GQAttention(nn.Module):
         if mask is not None:
             attn = attn + mask
         attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn.to(v.dtype), v)  # softmax may upcast under bf16 AMP; align with v
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -385,7 +385,7 @@ class MLAttention(nn.Module):
         if mask is not None:
             attn = attn + mask
         attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        out = torch.matmul(attn.to(v.dtype), v)  # (B, H, T, v_dim); softmax may upcast under bf16 AMP
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
