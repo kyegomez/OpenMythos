@@ -72,6 +72,125 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # Aux-loss-free load-balancing (DeepSeek-V3). The router_bias is nudged
+    # toward under-used experts after each training step by `bias_update_speed`.
+    # Set bias_update_speed=0 to freeze the bias (pure unbiased routing).
+    bias_update_speed: float = 1e-3
+    # Loop-index embedding base frequency (separate from sequence-RoPE theta
+    # because the recurrence depth is on a different scale than token position).
+    loop_rope_theta: float = 10000.0
+    # Initial gain for the LTIInjection input gate B. Smaller = gentler input
+    # injection at the start of training; 0.1 is the published default.
+    lti_b_init: float = 0.1
+    # Weight init stddev for Linear and Embedding layers.
+    init_std: float = 0.02
+
+    def __post_init__(self) -> None:
+        """
+        Validate hyperparameters at construction time so misconfigurations
+        surface with a clear error message instead of a cryptic shape failure
+        deep inside the forward pass.
+        """
+        # --- attention type ---
+        if self.attn_type not in ("gqa", "mla"):
+            raise ValueError(
+                f"attn_type must be 'gqa' or 'mla', got {self.attn_type!r}"
+            )
+
+        # --- core dims ---
+        if self.dim <= 0 or self.n_heads <= 0:
+            raise ValueError(
+                f"dim ({self.dim}) and n_heads ({self.n_heads}) must be positive"
+            )
+        if self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
+
+        # --- GQA head grouping ---
+        if self.attn_type == "gqa":
+            if self.n_kv_heads <= 0:
+                raise ValueError(f"n_kv_heads must be positive, got {self.n_kv_heads}")
+            if self.n_heads % self.n_kv_heads != 0:
+                raise ValueError(
+                    f"n_heads ({self.n_heads}) must be divisible by "
+                    f"n_kv_heads ({self.n_kv_heads}) for GQA"
+                )
+
+        # --- MLA RoPE head dim must be even (complex-pair reshape) ---
+        if self.attn_type == "mla":
+            if self.qk_rope_head_dim <= 0 or self.qk_rope_head_dim % 2 != 0:
+                raise ValueError(
+                    f"qk_rope_head_dim ({self.qk_rope_head_dim}) must be a "
+                    "positive even integer for MLA"
+                )
+            if self.kv_lora_rank <= 0 or self.q_lora_rank <= 0:
+                raise ValueError(
+                    "kv_lora_rank and q_lora_rank must be positive for MLA"
+                )
+
+        # --- GQA head_dim must be even too (complex-pair RoPE) ---
+        head_dim = self.dim // self.n_heads
+        if self.attn_type == "gqa" and head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim=dim/n_heads ({head_dim}) must be even for GQA "
+                "so RoPE's complex reshape succeeds"
+            )
+
+        # --- loop layers ---
+        if self.max_loop_iters <= 0:
+            raise ValueError(
+                f"max_loop_iters must be positive, got {self.max_loop_iters}"
+            )
+        if self.prelude_layers < 0 or self.coda_layers < 0:
+            raise ValueError("prelude_layers and coda_layers must be >= 0")
+
+        # --- loop_dim (sinusoidal index embedding) must be even ---
+        loop_dim = self.dim // 8
+        if loop_dim % 2 != 0:
+            raise ValueError(
+                f"cfg.dim // 8 ({loop_dim}) must be even for the loop-index "
+                f"embedding's sin/cos split (got dim={self.dim})"
+            )
+
+        # --- MoE ---
+        if self.n_experts <= 0 or self.expert_dim <= 0:
+            raise ValueError("n_experts and expert_dim must be positive")
+        if self.n_experts_per_tok <= 0:
+            raise ValueError("n_experts_per_tok must be positive")
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                f"n_experts_per_tok ({self.n_experts_per_tok}) cannot exceed "
+                f"n_experts ({self.n_experts})"
+            )
+        if self.n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be >= 0")
+
+        # --- ACT threshold must be in (0, 1] ---
+        if not 0.0 < self.act_threshold <= 1.0:
+            raise ValueError(
+                f"act_threshold must be in (0, 1], got {self.act_threshold}"
+            )
+
+        # --- dropout / init / bias speed sanity ---
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if self.bias_update_speed < 0.0:
+            raise ValueError(
+                f"bias_update_speed must be >= 0, got {self.bias_update_speed}"
+            )
+        if self.init_std <= 0.0:
+            raise ValueError(f"init_std must be positive, got {self.init_std}")
+
+        # --- LoRA ---
+        if self.lora_rank <= 0:
+            raise ValueError(f"lora_rank must be positive, got {self.lora_rank}")
+
+        # --- RoPE / sequence ---
+        if self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive, got {self.max_seq_len}")
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +340,12 @@ class GQAttention(nn.Module):
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
 
+        # Defensively slice freqs_cis to the current T. OpenMythos.forward
+        # already pre-slices with a start_pos offset; callers that skip
+        # that step (unit tests, ad-hoc scripts) would otherwise crash in
+        # apply_rope's broadcast shape check.
+        if freqs_cis.shape[0] != T:
+            freqs_cis = freqs_cis[:T]
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
@@ -242,7 +367,11 @@ class GQAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
             attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        # Upcast softmax to fp32: bf16 softmax loses precision on the tail,
+        # collapsing attention toward uniform or one-hot at long sequence
+        # lengths. Cost is tiny; numerical stability win is real.
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn = self.attn_drop(attn)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
@@ -340,6 +469,10 @@ class MLAttention(nn.Module):
         """
         B, T, _ = x.shape
 
+        # Defensive slice — see the matching comment in GQAttention.forward.
+        if freqs_cis.shape[0] != T:
+            freqs_cis = freqs_cis[:T]
+
         # Q
         c_q = self.q_norm(self.q_down(x))
         q_nope = self.q_up_nope(c_q).view(B, T, self.n_heads, self.qk_nope_dim)
@@ -384,7 +517,10 @@ class MLAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
             attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        # Upcast softmax to fp32 for numerical stability under bf16/fp16
+        # autocast (see GQAttention for rationale).
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn = self.attn_drop(attn)
         out = torch.matmul(attn, v)  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
@@ -453,8 +589,20 @@ class MoEFFN(nn.Module):
         self.topk = cfg.n_experts_per_tok
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
+        # Aux-loss-free bias (DeepSeek-V3): shifts expert SELECTION so that
+        # under-used experts get picked more, but never enters the gradient
+        # path (topk_scores come from the unbiased softmax). Updated in-place
+        # by OpenMythos.update_router_biases() after each optimizer step.
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        # Per-step load counter. Accumulates across microbatches during
+        # gradient accumulation; all-reduced across ranks inside update_bias()
+        # under FSDP/DDP, then zeroed. Non-persistent: rebuilt from scratch
+        # on every resume, not saved to checkpoints (router_bias is persisted).
+        self.register_buffer(
+            "expert_load",
+            torch.zeros(cfg.n_experts, dtype=torch.float32),
+            persistent=False,
+        )
 
         self.routed_experts = nn.ModuleList(
             [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
@@ -476,33 +624,107 @@ class MoEFFN(nn.Module):
         """
         B, T, D = x.shape
         flat = x.view(B * T, D)
+        N = B * T
 
+        # --- Router -----------------------------------------------------
         # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
-        # selection of which experts fire so underused experts are picked more,
-        # but the gating weights come from unbiased softmax scores so the bias
-        # never shows up in the gradient.
-        logits = self.router(flat)  # (B*T, n_experts), unbiased
-        scores = F.softmax(logits, dim=-1)
-        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
-        topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        # SELECTION of which experts fire so underused experts are picked more,
+        # but the gating weights come from the unbiased softmax so the bias
+        # never enters the gradient. Softmax upcast to fp32 for numerical
+        # stability under bf16/fp16 autocast.
+        logits = self.router(flat)                                 # (N, E)
+        scores = F.softmax(logits, dim=-1, dtype=torch.float32).to(flat.dtype)
+        _, topk_idx = (logits.float() + self.router_bias).topk(self.topk, dim=-1)
+        topk_scores = scores.gather(-1, topk_idx)                  # (N, K)
+        # clamp_min keeps the renorm denominator out of zero even when every
+        # selected expert's unbiased score underflows to ~0 in bf16/fp16.
+        denom = topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        topk_scores = topk_scores / denom
 
-        # routed expert dispatch (token-level scatter)
+        # Track expert load for the aux-loss-free bias update. Accumulates
+        # across microbatches; flushed by update_bias() post-optimizer-step.
+        if self.training:
+            with torch.no_grad():
+                load = torch.bincount(
+                    topk_idx.reshape(-1), minlength=self.n_experts
+                ).to(self.expert_load.dtype)
+                self.expert_load.add_(load)
+
+        # --- Vectorized dispatch ---------------------------------------
+        # One iteration per expert (not per (topk, expert) pair): gather
+        # the token slice routed to expert e, run a single dense matmul,
+        # scatter-add back weighted by the gate. Replaces the original
+        # O(topk * n_experts) Python loop with O(n_experts) dense ops.
+        flat_idx = topk_idx.reshape(-1)                            # (N*K,)
+        flat_scores = topk_scores.reshape(-1, 1)                   # (N*K, 1)
+        token_ids = (
+            torch.arange(N, device=flat.device)
+            .unsqueeze(-1)
+            .expand(N, self.topk)
+            .reshape(-1)
+        )                                                          # (N*K,)
+
+        # Stable-sort by expert so each expert's tokens are contiguous.
+        sort_order = flat_idx.argsort(stable=True)
+        sorted_experts = flat_idx[sort_order]
+        sorted_tokens = token_ids[sort_order]
+        sorted_scores = flat_scores[sort_order]
+
+        # Count tokens per expert; cumulative sum gives slice boundaries.
+        counts = torch.bincount(sorted_experts, minlength=self.n_experts)
+        offsets = torch.cat(
+            [
+                torch.zeros(1, dtype=counts.dtype, device=counts.device),
+                counts.cumsum(0),
+            ]
+        )
+
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        for eid in range(self.n_experts):
+            start = int(offsets[eid])
+            end = int(offsets[eid + 1])
+            if start == end:
+                continue
+            tok_slice = sorted_tokens[start:end]
+            weight_slice = sorted_scores[start:end]
+            expert_out = self.routed_experts[eid](flat[tok_slice])
+            out.index_add_(0, tok_slice, weight_slice * expert_out)
 
-        # shared experts always fire for every token
+        # Shared experts always fire for every token.
         for shared in self.shared_experts:
             out = out + shared(flat)
 
         return out.view(B, T, D)
+
+    @torch.no_grad()
+    def update_bias(self, speed: float) -> None:
+        """
+        Aux-loss-free load-balancing update (DeepSeek-V3, Eq. 16).
+
+        After each optimizer step, nudge `router_bias` toward under-used experts
+        so that subsequent forward passes route more tokens to them. Uses the
+        sign of (mean_load - expert_load) so the update magnitude is bounded
+        per step — the speed constant alone controls how aggressive balancing
+        is, independent of the imbalance magnitude.
+
+        Under FSDP/DDP, callers MUST all-reduce `expert_load` across ranks
+        before calling this method (see OpenMythos.update_router_biases).
+        After applying the update `expert_load` is zeroed.
+
+        Args:
+            speed -- per-step update magnitude. DeepSeek-V3 uses ~1e-3.
+        """
+        if speed == 0.0:
+            self.expert_load.zero_()
+            return
+        total = self.expert_load.sum()
+        if total <= 0:
+            # No training forward pass happened since last update; nothing to do.
+            return
+        mean = total / self.n_experts
+        direction = torch.sign(mean - self.expert_load).to(self.router_bias.dtype)
+        self.router_bias.add_(direction, alpha=speed)
+        self.expert_load.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -673,15 +895,18 @@ class LTIInjection(nn.Module):
     even at high learning rates.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, b_init: float = 0.1):
         """
         Args:
-            dim -- hidden state dimension; one scalar per channel for A and B
+            dim    -- hidden state dimension; one scalar per channel for A and B
+            b_init -- initial magnitude of the input-gate B. Smaller keeps the
+                      residual signal from the encoded input gentle at startup
+                      so training can find a stable regime before B grows.
         """
         super().__init__()
         self.log_A = nn.Parameter(torch.zeros(dim))  # log of A_continuous magnitude
         self.log_dt = nn.Parameter(torch.zeros(1))  # log of discretization step Δt
-        self.B = nn.Parameter(torch.ones(dim) * 0.1)
+        self.B = nn.Parameter(torch.ones(dim) * b_init)
 
     def get_A(self) -> torch.Tensor:
         """
@@ -693,8 +918,13 @@ class LTIInjection(nn.Module):
         """
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
-        # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        #
+        # Lower clamp at -10 (not -20): when the sum saturates at -20,
+        # exp(-exp(-20)) ≈ 1 - 2e-9, which rounds to exactly 1.0 in float32
+        # and breaks the strict ρ(A) < 1 invariant LTI depends on. At -10,
+        # exp(-exp(-10)) ≈ 1 - 4.5e-5 stays strictly below 1 with room to
+        # spare. Upper bound unchanged — it's only for finiteness.
+        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-10, 20)))
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
@@ -786,7 +1016,7 @@ class RecurrentBlock(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.block = TransformerBlock(cfg, use_moe=True)
-        self.injection = LTIInjection(cfg.dim)
+        self.injection = LTIInjection(cfg.dim, b_init=cfg.lti_b_init)
         self.act = ACTHalting(cfg.dim)
         self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim)
@@ -827,7 +1057,9 @@ class RecurrentBlock(nn.Module):
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            h_loop = loop_index_embedding(
+                h, t, self.loop_dim, theta=self.cfg.loop_rope_theta
+            )
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
@@ -930,12 +1162,25 @@ class OpenMythos(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Initialize all linear and embedding weights with N(0, 0.02)."""
+        """
+        Initialize all linear and embedding weights with N(0, cfg.init_std).
+        Router linear layers are initialized with a smaller std so expert
+        selection starts near-uniform and depends mostly on the aux-loss-free
+        router_bias during early training.
+        """
+        std = self.cfg.init_std
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.02)
+                nn.init.normal_(m.weight, std=std)
             elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
+                nn.init.normal_(m.weight, std=std)
+        # Nudge router logits closer to uniform at init: with std=0.02 a
+        # 12288-dim router still has enough signal to spike single experts
+        # before training has shaped them. Small std keeps routing diffuse
+        # long enough for the bias update to find a balance.
+        for m in self.modules():
+            if isinstance(m, MoEFFN):
+                nn.init.normal_(m.router.weight, std=std * 0.1)
 
     @staticmethod
     def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
@@ -995,6 +1240,42 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
         return self.head(self.norm(x))
+
+    @torch.no_grad()
+    def update_router_biases(
+        self,
+        speed: Optional[float] = None,
+        ddp: bool = False,
+    ) -> None:
+        """
+        Advance the aux-loss-free router_bias for every MoE layer.
+
+        Call this AFTER `optimizer.step()` each training step so the bias
+        update is not entangled with the weight gradients (the bias deliberately
+        sits outside the autograd graph). Under FSDP/DDP this all-reduces each
+        layer's `expert_load` across ranks before applying the update so every
+        rank converges to the same bias values without an extra checkpoint sync.
+
+        Args:
+            speed -- per-step bias step size; falls back to cfg.bias_update_speed.
+                     Pass 0.0 to freeze the bias (pure unbiased routing).
+            ddp   -- True to enable the cross-rank all-reduce on expert_load.
+        """
+        step = self.cfg.bias_update_speed if speed is None else speed
+        if step == 0.0:
+            # Even when frozen, flush counters so memory doesn't grow unbounded.
+            for m in self.modules():
+                if isinstance(m, MoEFFN):
+                    m.expert_load.zero_()
+            return
+        for m in self.modules():
+            if not isinstance(m, MoEFFN):
+                continue
+            if ddp and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    m.expert_load, op=torch.distributed.ReduceOp.SUM
+                )
+            m.update_bias(step)
 
     @torch.no_grad()
     def generate(
