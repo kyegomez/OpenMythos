@@ -38,9 +38,20 @@ classifiers = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-torch = "2.11.0"
-transformers = ">=4.40.0"
-datasets = ">=2.18.0"
+# Library constraints. torch 2.3 is the floor for the FSDP APIs we use
+# (ShardedGradScaler in torch.distributed.fsdp.sharded_grad_scaler,
+# torch.amp.autocast with device_type=, full_state_dict rank0_only=).
+# Pretraining runs should pin exact versions via training/requirements.txt.
+torch = ">=2.3.0,<3.0.0"
+transformers = ">=4.40.0,<5.0.0"
+datasets = ">=2.18.0,<4.0.0"
+
+
+[tool.poetry.group.training.dependencies]
+# Only required for the pretraining scripts in training/, not for using
+# the library for inference / architecture research.
+numpy = ">=1.26,<3.0"
+loguru = ">=0.7.3,<1.0.0"
 
 
 [tool.poetry.group.lint.dependencies]

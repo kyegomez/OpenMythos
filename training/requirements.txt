@@ -1,4 +1,24 @@
-torch>=2.11.0
-datasets>=3.6.0
-loguru>=0.7.3
-open-mythos
+# Pretraining-run requirements.
+#
+# Pinned to exact patch versions for *training* reproducibility across
+# nodes and weeks. Library consumers should use the top-level
+# requirements.txt, which uses compatible ranges instead.
+#
+# When bumping torch here, also bump pyproject.toml's torch constraint
+# and rerun `python -m open_mythos` smoke tests to confirm the new
+# version still exposes:
+#   - torch.distributed.fsdp.ShardingStrategy.FULL_SHARD
+#   - torch.distributed.fsdp.sharded_grad_scaler.ShardedGradScaler
+#   - torch.amp.autocast(device_type=..., dtype=...)
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.11.0
+transformers==4.46.3
+datasets==3.2.0
+numpy>=1.26,<3.0
+loguru==0.7.3
+
+# install the local package in editable mode when running from a clone:
+#   pip install -r training/requirements.txt
+#   pip install -e .
