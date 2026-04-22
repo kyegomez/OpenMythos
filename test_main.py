@@ -486,7 +486,10 @@ class TestLTIInjection:
         loss.backward()
         opt.step()
         A = self.inj.get_A()
-        assert A.max().item() < 1.0
+        # ZOH discretization: exp(-exp(clamp(x, -20, 20))). At the clamp
+        # boundary, exp(-exp(-20)) ≈ 1.0 in float32. The stability guarantee
+        # is A ∈ (0, 1] — 1.0 means no decay (neutral), not divergence.
+        assert A.max().item() <= 1.0
 
 
 # ---------------------------------------------------------------------------
