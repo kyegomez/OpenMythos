@@ -389,21 +389,27 @@ class MLAttention(nn.Module):
         # KV compress
         kv_raw = self.kv_down(x)
         c_kv = kv_raw[..., : self.kv_lora_rank]  # (B, T, lora_rank)  ← cached
-        k_rope = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim)
-        # expand rope keys across heads and apply RoPE before caching so
-        # retrieved keys are already positionally encoded
-        k_rope = (
-            k_rope.unsqueeze(2)
-            .expand(B, T, self.n_heads, self.qk_rope_dim)
-            .contiguous()
-        )
-        k_rope = apply_rope(k_rope, freqs_cis)  # (B, T, H, rope_dim) ← cached
+        k_rope_shared = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim)
+        # DeepSeek-V2 MLA caches ONE shared rope sub-head per token, not one
+        # per head. Apply RoPE on the shared (B, T, rope_dim) vector and cache
+        # that; expand to per-head only at compute time via a broadcast view
+        # (cost-free, not a copy). Caching per-head would negate MLA's
+        # memory win (n_heads× blowup on the rope cache).
+        # apply_rope expects a head axis, so add and drop a size-1 head dim.
+        k_rope_shared = apply_rope(
+            k_rope_shared.unsqueeze(2), freqs_cis
+        ).squeeze(2)  # (B, T, rope_dim)
 
         if kv_cache is not None:
             if cache_key in kv_cache:
                 c_kv = torch.cat([kv_cache[cache_key]["c_kv"], c_kv], dim=1)
-                k_rope = torch.cat([kv_cache[cache_key]["k_rope"], k_rope], dim=1)
-            kv_cache[cache_key] = {"c_kv": c_kv.detach(), "k_rope": k_rope.detach()}
+                k_rope_shared = torch.cat(
+                    [kv_cache[cache_key]["k_rope"], k_rope_shared], dim=1
+                )
+            kv_cache[cache_key] = {
+                "c_kv": c_kv.detach(),
+                "k_rope": k_rope_shared.detach(),
+            }
 
         S = c_kv.shape[1]  # full sequence length including cache
 
@@ -412,6 +418,8 @@ class MLAttention(nn.Module):
         kv = kv.view(B, S, self.n_heads, self.qk_nope_dim + self.v_dim)
         k_nope = kv[..., : self.qk_nope_dim]  # (B, S, H, nope)
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
+        # Broadcast the shared rope sub-head across all heads at compute time.
+        k_rope = k_rope_shared.unsqueeze(2).expand(B, S, self.n_heads, self.qk_rope_dim)
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
 
         # attention
