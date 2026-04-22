@@ -601,7 +601,7 @@ class TestOpenMythosGQA:
 # ---------------------------------------------------------------------------
 
 
-class TestOpenMythosMLА:
+class TestOpenMythosMLA:
     def setup_method(self):
         self.cfg = mla_cfg()
         self.model = OpenMythos(self.cfg)
