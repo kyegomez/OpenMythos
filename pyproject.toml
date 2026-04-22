@@ -14,7 +14,7 @@ dependencies = [
     "torch>=2.1.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 test = [
     "pytest>=7.0.0",
 ]
