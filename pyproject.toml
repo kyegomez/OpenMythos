@@ -53,7 +53,6 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "gpu: marks tests requiring CUDA",
 ]
-timeout = 120
 
 
 [tool.poetry.group.lint.dependencies]

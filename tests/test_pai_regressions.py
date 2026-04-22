@@ -40,8 +40,9 @@ def test_config_rejects_topk_gt_experts():
 
 
 def test_config_rejects_odd_head_dim():
+    # dim=10, n_heads=2 → head_dim=5 (odd, cannot RoPE-rotate)
     with pytest.raises(ValueError, match="head_dim"):
-        MythosConfig(dim=30, n_heads=3, n_kv_heads=3)
+        MythosConfig(dim=10, n_heads=2, n_kv_heads=2)
 
 
 def test_config_rejects_zero_loops():
