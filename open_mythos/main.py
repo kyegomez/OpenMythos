@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -50,7 +50,7 @@ class MythosConfig:
     prelude_layers: int = 2
     coda_layers: int = 2
     # Attention type: "gqa" | "mla"
-    attn_type: str = "mla"
+    attn_type: Literal["gqa", "mla"] = "mla"
     # MLA params (only used when attn_type="mla")
     kv_lora_rank: int = 512  # compressed KV latent cached instead of full K/V
     q_lora_rank: int = 1536  # compressed Q latent dim
@@ -72,6 +72,45 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Validate config invariants. Fail loud at construction time, not
+        deep inside the forward pass."""
+        if self.attn_type not in ("gqa", "mla"):
+            raise ValueError(
+                f"attn_type must be 'gqa' or 'mla', got {self.attn_type!r}"
+            )
+        if self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be divisible by "
+                f"n_kv_heads ({self.n_kv_heads}) for GQA"
+            )
+        head_dim = self.dim // self.n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be even for RoPE"
+            )
+        if self.attn_type == "mla" and self.qk_rope_head_dim % 2 != 0:
+            raise ValueError(
+                f"qk_rope_head_dim ({self.qk_rope_head_dim}) must be even for RoPE"
+            )
+        if self.max_loop_iters < 1:
+            raise ValueError(
+                f"max_loop_iters must be >= 1, got {self.max_loop_iters}"
+            )
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                f"n_experts_per_tok ({self.n_experts_per_tok}) cannot exceed "
+                f"n_experts ({self.n_experts})"
+            )
+        if not 0.0 < self.act_threshold <= 1.0:
+            raise ValueError(
+                f"act_threshold must be in (0, 1], got {self.act_threshold}"
+            )
 
 
 # ---------------------------------------------------------------------------
