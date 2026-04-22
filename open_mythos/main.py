@@ -1034,6 +1034,13 @@ class OpenMythos(nn.Module):
             Logits of shape (B, T, vocab_size)
         """
         T = input_ids.shape[1]
+        if T == 0:
+            raise ValueError("input_ids must be non-empty")
+        if start_pos + T > self.cfg.max_seq_len:
+            raise ValueError(
+                f"start_pos + T = {start_pos + T} exceeds max_seq_len "
+                f"{self.cfg.max_seq_len}; precomputed RoPE frequencies end here"
+            )
         device = input_ids.device
 
         x = self.embed(input_ids)
@@ -1061,6 +1068,7 @@ class OpenMythos(nn.Module):
         n_loops: int = 8,
         temperature: float = 1.0,
         top_k: int = 50,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Autoregressive token generation with KV caching.
@@ -1075,31 +1083,55 @@ class OpenMythos(nn.Module):
 
         Args:
             input_ids      -- prompt token indices of shape (B, T)
-            max_new_tokens -- number of tokens to generate
+            max_new_tokens -- number of tokens to generate (clamped to fit max_seq_len)
             n_loops        -- recurrent loop depth for each decode step
             temperature    -- softmax temperature; lower = more greedy
             top_k          -- restrict sampling to top-K logits (0 = disabled)
+            eos_token_id   -- if set, stop a batch row once it has produced this token
 
         Returns:
-            Token indices of shape (B, T + max_new_tokens)
+            Token indices of shape (B, T + generated_len). generated_len may be
+            less than max_new_tokens if every row hit EOS or max_seq_len.
         """
-        kv_cache: dict = {}
-        prompt_len = input_ids.shape[1]
-        for step in range(max_new_tokens):
-            if step == 0:
-                cur_ids = input_ids
-                start_pos = 0
-            else:
-                cur_ids = input_ids[:, -1:]
-                start_pos = prompt_len + step - 1
-            logits = self.forward(
-                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
-            )
-            logits = logits[:, -1, :] / temperature
-            if top_k > 0:
-                v, _ = logits.topk(top_k)
-                logits[logits < v[:, -1:]] = float("-inf")
-            probs = F.softmax(logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_tok], dim=1)
-        return input_ids
+        was_training = self.training
+        self.eval()  # disable dropout during generation regardless of prior mode
+        try:
+            prompt_len = input_ids.shape[1]
+            budget = self.cfg.max_seq_len - prompt_len
+            if budget <= 0:
+                return input_ids
+            max_new_tokens = min(max_new_tokens, budget)
+
+            kv_cache: dict = {}
+            finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            for step in range(max_new_tokens):
+                if step == 0:
+                    cur_ids = input_ids
+                    start_pos = 0
+                else:
+                    cur_ids = input_ids[:, -1:]
+                    start_pos = prompt_len + step - 1
+                logits = self.forward(
+                    cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+                )
+                logits = logits[:, -1, :] / temperature
+                if top_k > 0:
+                    v, _ = logits.topk(top_k)
+                    logits[logits < v[:, -1:]] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                if eos_token_id is not None:
+                    # Finished rows keep emitting eos to preserve shape.
+                    next_tok = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(next_tok, eos_token_id),
+                        next_tok,
+                    )
+                    finished = finished | (next_tok.squeeze(-1) == eos_token_id)
+                input_ids = torch.cat([input_ids, next_tok], dim=1)
+                if eos_token_id is not None and finished.all():
+                    break
+            return input_ids
+        finally:
+            if was_training:
+                self.train()
