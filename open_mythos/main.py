@@ -869,10 +869,13 @@ class RecurrentBlock(nn.Module):
             # once (on the halting step) and zero thereafter — otherwise
             # threshold<1 leaves a non-zero remainder that leaks every step.
             remainder = (1.0 - cumulative_p).clamp(min=0)
+            crossing = still_running & (
+                cumulative_p + p >= self.cfg.act_threshold
+            )
             weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
+                crossing,
                 remainder,
-                p,
+                p * still_running.float(),
             )
             weight = weight * still_running.float()
             h_out = h_out + weight.unsqueeze(-1) * h
