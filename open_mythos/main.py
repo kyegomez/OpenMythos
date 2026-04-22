@@ -72,6 +72,11 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # Wrap the recurrent block body in torch.utils.checkpoint to trade
+    # compute for memory during training. Saves ~sqrt(n_loops) activation
+    # memory at the cost of one extra forward per backward. Essential at
+    # 1T scale; a no-op in eval mode.
+    gradient_checkpointing: bool = False
 
     def __post_init__(self) -> None:
         """Validate config invariants. Fail loud at construction time, not
@@ -278,11 +283,20 @@ class GQAttention(nn.Module):
         v = v.transpose(1, 2)
 
         scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
+        # F.scaled_dot_product_attention auto-dispatches to FlashAttention-2/3
+        # or the memory-efficient kernel on CUDA bf16/fp16; falls back to the
+        # math kernel for fp32 / unsupported shapes. Either is faster and more
+        # memory-efficient than the manual softmax(QK^T)V form and avoids
+        # materializing the full (B, H, T, S) attention matrix.
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        is_causal = mask is None and kv_cache is None
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask if not is_causal else None,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+            scale=scale,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -428,11 +442,18 @@ class MLAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
         scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        # SDPA picks FlashAttention-2/3 / memory-efficient kernel where
+        # available. MLA's asymmetric q_head_dim vs v_dim is handled fine
+        # by SDPA as long as q and k share the last dim (they do here).
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        is_causal = mask is None and kv_cache is None
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask if not is_causal else None,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+            scale=scale,
+        )  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -884,7 +905,22 @@ class RecurrentBlock(nn.Module):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            if (
+                self.training
+                and self.cfg.gradient_checkpointing
+                and kv_cache is None
+            ):
+                # use_reentrant=False is the 2026 standard form — supports
+                # nested checkpointing and torch.compile. Only safe without
+                # a KV cache since the cache is a mutable side-effect that
+                # would get replayed in the recompute pass.
+                from torch.utils.checkpoint import checkpoint
+                trans_out = checkpoint(
+                    self.block, combined, freqs_cis, mask, None, cache_key,
+                    use_reentrant=False,
+                )
+            else:
+                trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
