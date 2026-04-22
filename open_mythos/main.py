@@ -570,15 +570,18 @@ def loop_index_embedding(
     Returns:
         h with a sinusoidal bias added to its first loop_dim channels; same shape
     """
+    # Compute frequencies in fp32. In bf16 (only 7 bits of mantissa) many adjacent
+    # k indices quantize to the same float, so multiple channel-pairs would share
+    # identical sin/cos and the loop-index signal degenerates.
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32) / loop_dim)
     )
     angles = loop_t * freqs  # (loop_dim//2,)
     emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
-    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
+    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=torch.float32)
     emb_full[:loop_dim] = emb
-    return h + emb_full.unsqueeze(0).unsqueeze(0)
+    return h + emb_full.to(h.dtype).unsqueeze(0).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -727,13 +730,17 @@ class LTIInjection(nn.Module):
         Compute the discretized diagonal state matrix A_discrete.
 
         Returns:
-            1-D tensor of shape (dim,) with all values strictly in (0, 1),
+            1-D tensor of shape (dim,) in (0, 1) (same dtype as log_A),
             guaranteeing ρ(A) < 1 regardless of learned parameter values.
         """
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
-        # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # Upcast to fp32 before the nested exp: in bf16, exp(-10) underflows to 0
+        # and then exp(-0)=1.0 exactly, silently making ρ(A)=1 (marginal stability).
+        # Clamp is tightened to (-10, 10) which keeps the result strictly in (0, 1)
+        # even in fp32.
+        x = (self.log_dt + self.log_A).float().clamp(-10.0, 10.0)
+        return torch.exp(-torch.exp(x)).to(self.log_A.dtype)
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
@@ -899,6 +906,14 @@ class RecurrentBlock(nn.Module):
             if halted.all() and kv_cache is None:
                 break
 
+        # Positions that never halted within n_loops have cumulative_p < threshold.
+        # Flush the remaining mass so every position's weights sum to ~1 and h_out
+        # magnitudes are consistent across halted and still-running tokens.
+        still_running = ~halted
+        if still_running.any():
+            remainder = (1.0 - cumulative_p).clamp(min=0) * still_running.float()
+            h_out = h_out + remainder.unsqueeze(-1) * h
+
         return h_out
 
 
@@ -964,9 +979,12 @@ class OpenMythos(nn.Module):
 
         self.norm = RMSNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-        self.head.weight = self.embed.weight  # weight tying
 
+        # Initialize BEFORE tying so _init_weights does not overwrite the shared
+        # tensor twice (once as embed.weight, once as head.weight, second call
+        # wiping the first random draw).
         self._init_weights()
+        self.head.weight = self.embed.weight  # weight tying
 
     def _init_weights(self) -> None:
         """Initialize all linear and embedding weights with N(0, 0.02)."""
