@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -50,7 +50,7 @@ class MythosConfig:
     prelude_layers: int = 2
     coda_layers: int = 2
     # Attention type: "gqa" | "mla"
-    attn_type: str = "mla"
+    attn_type: Literal["gqa", "mla"] = "mla"
     # MLA params (only used when attn_type="mla")
     kv_lora_rank: int = 512  # compressed KV latent cached instead of full K/V
     q_lora_rank: int = 1536  # compressed Q latent dim
@@ -72,6 +72,50 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # Wrap the recurrent block body in torch.utils.checkpoint to trade
+    # compute for memory during training. Saves ~sqrt(n_loops) activation
+    # memory at the cost of one extra forward per backward. Essential at
+    # 1T scale; a no-op in eval mode.
+    gradient_checkpointing: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate config invariants. Fail loud at construction time, not
+        deep inside the forward pass."""
+        if self.attn_type not in ("gqa", "mla"):
+            raise ValueError(
+                f"attn_type must be 'gqa' or 'mla', got {self.attn_type!r}"
+            )
+        if self.dim % self.n_heads != 0:
+            raise ValueError(
+                f"dim ({self.dim}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if self.n_heads % self.n_kv_heads != 0:
+            raise ValueError(
+                f"n_heads ({self.n_heads}) must be divisible by "
+                f"n_kv_heads ({self.n_kv_heads}) for GQA"
+            )
+        head_dim = self.dim // self.n_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                f"head_dim ({head_dim}) must be even for RoPE"
+            )
+        if self.attn_type == "mla" and self.qk_rope_head_dim % 2 != 0:
+            raise ValueError(
+                f"qk_rope_head_dim ({self.qk_rope_head_dim}) must be even for RoPE"
+            )
+        if self.max_loop_iters < 1:
+            raise ValueError(
+                f"max_loop_iters must be >= 1, got {self.max_loop_iters}"
+            )
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                f"n_experts_per_tok ({self.n_experts_per_tok}) cannot exceed "
+                f"n_experts ({self.n_experts})"
+            )
+        if not 0.0 < self.act_threshold <= 1.0:
+            raise ValueError(
+                f"act_threshold must be in (0, 1], got {self.act_threshold}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -239,11 +283,20 @@ class GQAttention(nn.Module):
         v = v.transpose(1, 2)
 
         scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
+        # F.scaled_dot_product_attention auto-dispatches to FlashAttention-2/3
+        # or the memory-efficient kernel on CUDA bf16/fp16; falls back to the
+        # math kernel for fp32 / unsupported shapes. Either is faster and more
+        # memory-efficient than the manual softmax(QK^T)V form and avoids
+        # materializing the full (B, H, T, S) attention matrix.
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        is_causal = mask is None and kv_cache is None
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask if not is_causal else None,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+            scale=scale,
+        )
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -350,21 +403,27 @@ class MLAttention(nn.Module):
         # KV compress
         kv_raw = self.kv_down(x)
         c_kv = kv_raw[..., : self.kv_lora_rank]  # (B, T, lora_rank)  ← cached
-        k_rope = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim)
-        # expand rope keys across heads and apply RoPE before caching so
-        # retrieved keys are already positionally encoded
-        k_rope = (
-            k_rope.unsqueeze(2)
-            .expand(B, T, self.n_heads, self.qk_rope_dim)
-            .contiguous()
-        )
-        k_rope = apply_rope(k_rope, freqs_cis)  # (B, T, H, rope_dim) ← cached
+        k_rope_shared = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim)
+        # DeepSeek-V2 MLA caches ONE shared rope sub-head per token, not one
+        # per head. Apply RoPE on the shared (B, T, rope_dim) vector and cache
+        # that; expand to per-head only at compute time via a broadcast view
+        # (cost-free, not a copy). Caching per-head would negate MLA's
+        # memory win (n_heads× blowup on the rope cache).
+        # apply_rope expects a head axis, so add and drop a size-1 head dim.
+        k_rope_shared = apply_rope(
+            k_rope_shared.unsqueeze(2), freqs_cis
+        ).squeeze(2)  # (B, T, rope_dim)
 
         if kv_cache is not None:
             if cache_key in kv_cache:
                 c_kv = torch.cat([kv_cache[cache_key]["c_kv"], c_kv], dim=1)
-                k_rope = torch.cat([kv_cache[cache_key]["k_rope"], k_rope], dim=1)
-            kv_cache[cache_key] = {"c_kv": c_kv.detach(), "k_rope": k_rope.detach()}
+                k_rope_shared = torch.cat(
+                    [kv_cache[cache_key]["k_rope"], k_rope_shared], dim=1
+                )
+            kv_cache[cache_key] = {
+                "c_kv": c_kv.detach(),
+                "k_rope": k_rope_shared.detach(),
+            }
 
         S = c_kv.shape[1]  # full sequence length including cache
 
@@ -373,6 +432,8 @@ class MLAttention(nn.Module):
         kv = kv.view(B, S, self.n_heads, self.qk_nope_dim + self.v_dim)
         k_nope = kv[..., : self.qk_nope_dim]  # (B, S, H, nope)
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
+        # Broadcast the shared rope sub-head across all heads at compute time.
+        k_rope = k_rope_shared.unsqueeze(2).expand(B, S, self.n_heads, self.qk_rope_dim)
         k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
 
         # attention
@@ -381,11 +442,18 @@ class MLAttention(nn.Module):
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
         scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
+        # SDPA picks FlashAttention-2/3 / memory-efficient kernel where
+        # available. MLA's asymmetric q_head_dim vs v_dim is handled fine
+        # by SDPA as long as q and k share the last dim (they do here).
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        is_causal = mask is None and kv_cache is None
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask if not is_causal else None,
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+            scale=scale,
+        )  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
@@ -531,15 +599,18 @@ def loop_index_embedding(
     Returns:
         h with a sinusoidal bias added to its first loop_dim channels; same shape
     """
+    # Compute frequencies in fp32. In bf16 (only 7 bits of mantissa) many adjacent
+    # k indices quantize to the same float, so multiple channel-pairs would share
+    # identical sin/cos and the loop-index signal degenerates.
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32) / loop_dim)
     )
     angles = loop_t * freqs  # (loop_dim//2,)
     emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
-    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
+    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=torch.float32)
     emb_full[:loop_dim] = emb
-    return h + emb_full.unsqueeze(0).unsqueeze(0)
+    return h + emb_full.to(h.dtype).unsqueeze(0).unsqueeze(0)
 
 
 # ---------------------------------------------------------------------------
@@ -688,13 +759,17 @@ class LTIInjection(nn.Module):
         Compute the discretized diagonal state matrix A_discrete.
 
         Returns:
-            1-D tensor of shape (dim,) with all values strictly in (0, 1),
+            1-D tensor of shape (dim,) in (0, 1) (same dtype as log_A),
             guaranteeing ρ(A) < 1 regardless of learned parameter values.
         """
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
-        # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # Upcast to fp32 before the nested exp: in bf16, exp(-10) underflows to 0
+        # and then exp(-0)=1.0 exactly, silently making ρ(A)=1 (marginal stability).
+        # Clamp is tightened to (-10, 10) which keeps the result strictly in (0, 1)
+        # even in fp32.
+        x = (self.log_dt + self.log_A).float().clamp(-10.0, 10.0)
+        return torch.exp(-torch.exp(x)).to(self.log_A.dtype)
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
@@ -830,7 +905,22 @@ class RecurrentBlock(nn.Module):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
-            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            if (
+                self.training
+                and self.cfg.gradient_checkpointing
+                and kv_cache is None
+            ):
+                # use_reentrant=False is the 2026 standard form — supports
+                # nested checkpointing and torch.compile. Only safe without
+                # a KV cache since the cache is a mutable side-effect that
+                # would get replayed in the recompute pass.
+                from torch.utils.checkpoint import checkpoint
+                trans_out = checkpoint(
+                    self.block, combined, freqs_cis, mask, None, cache_key,
+                    use_reentrant=False,
+                )
+            else:
+                trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
@@ -859,6 +949,14 @@ class RecurrentBlock(nn.Module):
             # later decode steps find populated keys at every cache_key.
             if halted.all() and kv_cache is None:
                 break
+
+        # Positions that never halted within n_loops have cumulative_p < threshold.
+        # Flush the remaining mass so every position's weights sum to ~1 and h_out
+        # magnitudes are consistent across halted and still-running tokens.
+        still_running = ~halted
+        if still_running.any():
+            remainder = (1.0 - cumulative_p).clamp(min=0) * still_running.float()
+            h_out = h_out + remainder.unsqueeze(-1) * h
 
         return h_out
 
@@ -925,9 +1023,12 @@ class OpenMythos(nn.Module):
 
         self.norm = RMSNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-        self.head.weight = self.embed.weight  # weight tying
 
+        # Initialize BEFORE tying so _init_weights does not overwrite the shared
+        # tensor twice (once as embed.weight, once as head.weight, second call
+        # wiping the first random draw).
         self._init_weights()
+        self.head.weight = self.embed.weight  # weight tying
 
     def _init_weights(self) -> None:
         """Initialize all linear and embedding weights with N(0, 0.02)."""
@@ -977,6 +1078,13 @@ class OpenMythos(nn.Module):
             Logits of shape (B, T, vocab_size)
         """
         T = input_ids.shape[1]
+        if T == 0:
+            raise ValueError("input_ids must be non-empty")
+        if start_pos + T > self.cfg.max_seq_len:
+            raise ValueError(
+                f"start_pos + T = {start_pos + T} exceeds max_seq_len "
+                f"{self.cfg.max_seq_len}; precomputed RoPE frequencies end here"
+            )
         device = input_ids.device
 
         x = self.embed(input_ids)
@@ -1004,6 +1112,7 @@ class OpenMythos(nn.Module):
         n_loops: int = 8,
         temperature: float = 1.0,
         top_k: int = 50,
+        eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Autoregressive token generation with KV caching.
@@ -1018,31 +1127,56 @@ class OpenMythos(nn.Module):
 
         Args:
             input_ids      -- prompt token indices of shape (B, T)
-            max_new_tokens -- number of tokens to generate
+            max_new_tokens -- number of tokens to generate (clamped to fit max_seq_len)
             n_loops        -- recurrent loop depth for each decode step
             temperature    -- softmax temperature; lower = more greedy
             top_k          -- restrict sampling to top-K logits (0 = disabled)
+            eos_token_id   -- if set, stop a batch row once it has produced this token
 
         Returns:
-            Token indices of shape (B, T + max_new_tokens)
+            Token indices of shape (B, T + generated_len). generated_len may be
+            less than max_new_tokens if every row hit EOS or max_seq_len.
         """
-        kv_cache: dict = {}
-        prompt_len = input_ids.shape[1]
-        for step in range(max_new_tokens):
-            if step == 0:
-                cur_ids = input_ids
-                start_pos = 0
-            else:
-                cur_ids = input_ids[:, -1:]
-                start_pos = prompt_len + step - 1
-            logits = self.forward(
-                cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
-            )
-            logits = logits[:, -1, :] / temperature
-            if top_k > 0:
-                v, _ = logits.topk(top_k)
-                logits[logits < v[:, -1:]] = float("-inf")
-            probs = F.softmax(logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat([input_ids, next_tok], dim=1)
-        return input_ids
+        was_training = self.training
+        self.eval()  # disable dropout during generation regardless of prior mode
+        try:
+            prompt_len = input_ids.shape[1]
+            budget = self.cfg.max_seq_len - prompt_len
+            if budget <= 0:
+                return input_ids
+            max_new_tokens = min(max_new_tokens, budget)
+
+            kv_cache: dict = {}
+            finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+            for step in range(max_new_tokens):
+                if step == 0:
+                    cur_ids = input_ids
+                    start_pos = 0
+                else:
+                    cur_ids = input_ids[:, -1:]
+                    start_pos = prompt_len + step - 1
+                logits = self.forward(
+                    cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos
+                )
+                logits = logits[:, -1, :] / temperature
+                if top_k > 0:
+                    effective_k = min(top_k, logits.shape[-1])
+                    v, _ = logits.topk(effective_k)
+                    logits[logits < v[:, -1:]] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+                if eos_token_id is not None:
+                    # Finished rows keep emitting eos to preserve shape.
+                    next_tok = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(next_tok, eos_token_id),
+                        next_tok,
+                    )
+                    finished = finished | (next_tok.squeeze(-1) == eos_token_id)
+                input_ids = torch.cat([input_ids, next_tok], dim=1)
+                if eos_token_id is not None and finished.all():
+                    break
+            return input_ids
+        finally:
+            if was_training:
+                self.train()
