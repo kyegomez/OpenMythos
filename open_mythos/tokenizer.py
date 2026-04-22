@@ -1,11 +1,13 @@
-from transformers import AutoTokenizer
-
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
 
 
 class MythosTokenizer:
     """
     HuggingFace tokenizer wrapper for OpenMythos.
+
+    The underlying transformers import is deferred into __init__ so that
+    `import open_mythos` does not pay the transformers import cost unless the
+    tokenizer is actually constructed.
 
     Args:
         model_id (str): The HuggingFace model ID or path to use with AutoTokenizer.
@@ -27,7 +29,19 @@ class MythosTokenizer:
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
         """
+        from transformers import AutoTokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    @property
+    def eos_token_id(self) -> int | None:
+        """End-of-sequence token id, or None if the tokenizer does not define one."""
+        return self.tokenizer.eos_token_id
+
+    @property
+    def pad_token_id(self) -> int | None:
+        """Pad token id, or None if the tokenizer does not define one."""
+        return self.tokenizer.pad_token_id
 
     @property
     def vocab_size(self) -> int:
