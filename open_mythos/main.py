@@ -112,8 +112,9 @@ class RMSNorm(nn.Module):
         Returns:
             RMS-normalized tensor of the same shape, rescaled by self.weight
         """
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return x * rms * self.weight
+        dtype = x.dtype
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x * rms * self.weight).to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,7 @@ class GQAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        x = x.to(self.wq.weight.dtype)  # align with FSDP param dtype
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -268,7 +270,7 @@ class GQAttention(nn.Module):
             if mask is not None:
                 attn = attn + mask
             attn = F.dropout(
-                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+                F.softmax(attn, dim=-1).to(v.dtype), p=self.dropout_p, training=self.training
             )
             out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -367,6 +369,7 @@ class MLAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        x = x.to(self.q_down.weight.dtype)  # align with FSDP param dtype
 
         # Q
         c_q = self.q_norm(self.q_down(x))
@@ -412,7 +415,7 @@ class MLAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
             attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        attn = self.attn_drop(F.softmax(attn, dim=-1).to(v.dtype))
         out = torch.matmul(attn, v)  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
@@ -450,6 +453,7 @@ class Expert(nn.Module):
         Returns:
             Tensor of shape (..., dim)
         """
+        x = x.to(self.gate.weight.dtype)  # align with FSDP param dtype
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
@@ -503,6 +507,7 @@ class MoEFFN(nn.Module):
             of the weighted routed expert outputs
         """
         B, T, D = x.shape
+        x = x.to(self.router.weight.dtype)  # align with FSDP param dtype
         flat = x.view(B * T, D)
 
         # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
@@ -615,6 +620,7 @@ class LoRAAdapter(nn.Module):
         max_t = self.scale.num_embeddings - 1
         t_idx = loop_t if loop_t <= max_t else max_t
         s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
+        x = x.to(self.down.weight.dtype)  # align with FSDP param dtype
         down = self.down(x) * s  # (B, T, rank)
         return down @ self.B  # (B, T, dim)
 
@@ -777,7 +783,7 @@ class ACTHalting(nn.Module):
         Returns:
             Halting probability tensor of shape (B, T), values in (0, 1)
         """
-        return torch.sigmoid(self.halt(h)).squeeze(-1)
+        return torch.sigmoid(self.halt(h.to(self.halt.weight.dtype))).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +1037,8 @@ class OpenMythos(nn.Module):
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        return self.head(self.norm(x))
+        x = self.norm(x)
+        return self.head(x.to(self.head.weight.dtype))
 
     @torch.no_grad()
     def generate(
