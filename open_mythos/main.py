@@ -5,6 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from flash_attn import flash_attn_func
+
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+
 
 @dataclass
 class MythosConfig:
@@ -169,11 +176,16 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 class GQAttention(nn.Module):
     """
-    Grouped Query Attention (Ainslie et al., 2023).
+    Grouped Query Attention (Ainslie et al., 2023) with Flash Attention 2 (Dao et al., 2023).
 
     Uses fewer KV heads than Q heads (n_kv_heads < n_heads). Each KV head is
     shared across n_heads // n_kv_heads query heads, reducing the KV cache size
     by that factor while keeping full query expressiveness.
+
+    When flash-attn is installed, uses flash_attn_func which handles GQA natively
+    (no KV head expansion needed) and is IO-bound-optimal. Inputs are cast to
+    bfloat16 for flash_attn and restored to the original dtype afterward.
+    Falls back to manual scaled dot-product attention when flash-attn is absent.
 
     RoPE is applied to both Q and K. K and V are stored in kv_cache after
     RoPE application so that cached values are already positionally encoded and
@@ -195,7 +207,7 @@ class GQAttention(nn.Module):
         self.wk = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
-        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.dropout_p = cfg.dropout
 
     def forward(
         self,
@@ -230,21 +242,37 @@ class GQAttention(nn.Module):
                 v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
             kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
 
-        # expand KV to match Q heads
-        k = k.repeat_interleave(self.groups, dim=2)
-        v = v.repeat_interleave(self.groups, dim=2)
+        if _HAS_FLASH_ATTN:
+            # flash_attn_func expects (B, T, H, head_dim) — GQA is handled natively
+            # (n_kv_heads < n_heads is supported without repeat_interleave).
+            # causal=True when mask is present (full-sequence prefill/training);
+            # causal=False for single-token decode where T=1 and mask is None.
+            orig_dtype = q.dtype
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+            dropout_p = self.dropout_p if self.training else 0.0
+            out = flash_attn_func(
+                q, k, v, dropout_p=dropout_p, causal=(mask is not None)
+            )
+            out = out.to(orig_dtype).contiguous().view(B, T, -1)
+        else:
+            # Fallback: manual scaled dot-product with explicit KV head expansion.
+            k = k.repeat_interleave(self.groups, dim=2)
+            v = v.repeat_interleave(self.groups, dim=2)
+            q = q.transpose(1, 2)  # (B, H, T, head_dim)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            scale = self.head_dim**-0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if mask is not None:
+                attn = attn + mask
+            attn = F.dropout(
+                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+            )
+            out = torch.matmul(attn, v)
+            out = out.transpose(1, 2).contiguous().view(B, T, -1)
 
-        q = q.transpose(1, 2)  # (B, H, T, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
 
@@ -938,18 +966,27 @@ class OpenMythos(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
 
     @staticmethod
-    def _causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+    def _causal_mask(
+        seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         """
         Build an additive causal mask: 0 on and below the diagonal, -inf above.
 
         Args:
             seq_len -- sequence length
             device  -- target device
+            dtype   -- tensor dtype (must match activation dtype so the additive
+                       mask doesn't upcast the attention logits in the fallback
+                       attention path — e.g. bf16 weights with an fp32 mask
+                       promotes attn to fp32 and then breaks the fp32-vs-bf16
+                       matmul against V)
 
         Returns:
             Tensor of shape (1, 1, seq_len, seq_len) broadcastable over (B, H, T, S)
         """
-        mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device)
+        mask = torch.full(
+            (1, 1, seq_len, seq_len), float("-inf"), device=device, dtype=dtype
+        )
         return torch.triu(mask, diagonal=1)
 
     def forward(
@@ -983,7 +1020,7 @@ class OpenMythos(nn.Module):
         freqs_cis = (
             self.freqs_cis_mla if self.cfg.attn_type == "mla" else self.freqs_cis
         )[start_pos : start_pos + T]
-        mask = self._causal_mask(T, device) if T > 1 else None
+        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
 
         for i, layer in enumerate(self.prelude):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")

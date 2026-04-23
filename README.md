@@ -40,6 +40,12 @@ pip install open-mythos
 #uv pip install open-mythos
 ```
 
+To enable Flash Attention 2 in `GQAttention` (requires CUDA and build tools):
+
+```bash
+pip install open-mythos[flash]
+```
+
 ## Usage
 
 ```python
@@ -212,6 +218,17 @@ The injection of `e` at every step is what prevents the model from drifting — 
 
 The full implementation is in [`open_mythos/main.py`](open_mythos/main.py). See the [`OpenMythos` class reference](docs/open_mythos.md) for a detailed API walkthrough, configuration options, and usage examples.
 
+### Attention Implementations
+
+The attention layer is switchable via `cfg.attn_type`:
+
+| Option | Class | Description |
+|---|---|---|
+| `"gqa"` | `GQAttention` | Grouped Query Attention (Ainslie et al., 2023) — fewer KV heads than Q heads (`n_kv_heads < n_heads`), reducing KV-cache memory by `n_heads / n_kv_heads`. Uses **Flash Attention 2** (Dao et al., 2023) when `flash-attn>=2.8.3` is installed: GQA is handled natively (no KV head expansion), I/O-bound-optimal, with a transparent fallback to manual scaled dot-product attention when the package is absent. |
+| `"mla"` | `MLAttention` | Multi-Latent Attention (DeepSeek-V2) — caches a compressed KV latent (`kv_lora_rank`) rather than full K/V, with split RoPE / no-RoPE head dims for position-aware compression. |
+
+RoPE is applied to Q and K before caching, so cached values do not need to be re-rotated on retrieval.
+
 ---
 
 ## Why This Explains Mythos
@@ -366,6 +383,7 @@ Theoretical analysis suggests 2-3x improvements in inference throughput. For a d
 | Training stability | LTI-constrained injection parameters with spectral radius < 1 |
 | Loop differentiation | Likely uses loop-index positional embedding (à la RoPE) per iteration |
 | Halting | Adaptive Computation Time or learned convergence criterion |
+| Attention | GQA (with optional Flash Attention 2) or MLA with compressed KV latent cache |
 | Scaling law | Optimal training scales looping and data together, not parameters alone |
 | Reasoning vs. memory | Structurally biased toward composition; memorization requires separate treatment |
 | Deployment | Continuous Depth-wise Batching enables variable compute per request |
