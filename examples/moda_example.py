@@ -1,4 +1,11 @@
+import sys
+from pathlib import Path
+
 import torch
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from open_mythos.moda import MoDAConfig, MoDAModel
 
 
