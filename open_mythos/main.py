@@ -154,13 +154,18 @@ def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x         -- tensor of shape (B, T, H, head_dim); head_dim must be even
-        freqs_cis -- precomputed complex frequencies of shape (T, head_dim//2),
-                     already sliced to exactly the positions being processed
-                     (caller is responsible for correct start_pos offset)
+        freqs_cis -- precomputed complex frequencies of shape
+                     (>=T, head_dim//2) or exactly (T, head_dim//2)
 
     Returns:
-        Rotated tensor of the same shape and dtype as x
+            Rotated tensor of the same shape and dtype as x
     """
+    T = x.shape[1]
+    if freqs_cis.shape[0] < T:
+        raise RuntimeError(
+            f"RoPE frequencies length {freqs_cis.shape[0]} is shorter than sequence length {T}"
+        )
+    freqs_cis = freqs_cis[:T]
     xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     return (
         torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
@@ -722,7 +727,12 @@ class LTIInjection(nn.Module):
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
         # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        A = torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # Extreme negative logits can round back to exactly 1.0 in float32 even
+        # though the closed-form value is strictly smaller. Cap at the largest
+        # representable value below 1 to preserve the stability invariant.
+        upper = torch.nextafter(torch.ones_like(A), torch.zeros_like(A))
+        return torch.minimum(A, upper)
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
