@@ -544,6 +544,40 @@ class TestRecurrentBlock:
 
 
 # ---------------------------------------------------------------------------
+# MythosConfig / OpenMythos introspection
+# ---------------------------------------------------------------------------
+
+
+class TestMythosConfigIntrospection:
+    def test_runtime_profile_includes_cache_layout(self):
+        cfg = mla_cfg(prelude_layers=2, coda_layers=1, max_loop_iters=4)
+        profile = cfg.runtime_profile()
+
+        assert profile["model_name"] == "OpenMythos"
+        assert profile["attn_type"] == "mla"
+        assert profile["supports_kv_cache"] is True
+        assert profile["supports_incremental_decode"] is True
+        assert profile["cache_layout"]["prelude"] == ["prelude_0", "prelude_1"]
+        assert profile["cache_layout"]["recurrent"] == "recurrent_loop_{t}"
+        assert profile["cache_layout"]["coda"] == ["coda_0"]
+
+    def test_to_dict_round_trips_dataclass_fields(self):
+        cfg = gqa_cfg(dim=128, max_output_tokens=256)
+        data = cfg.to_dict()
+
+        assert data["dim"] == 128
+        assert data["max_output_tokens"] == 256
+        assert data["attn_type"] == "gqa"
+
+
+class TestOpenMythosIntrospection:
+    def test_describe_matches_config_profile(self):
+        cfg = gqa_cfg()
+        model = OpenMythos(cfg)
+
+        assert model.describe() == cfg.runtime_profile()
+
+# ---------------------------------------------------------------------------
 # OpenMythos — GQA mode
 # ---------------------------------------------------------------------------
 
