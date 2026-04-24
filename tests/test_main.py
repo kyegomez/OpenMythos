@@ -573,6 +573,12 @@ class TestMythosConfigIntrospection:
         with pytest.raises(ValueError, match="Unsupported attn_type"):
             gqa_cfg(attn_type="mlaa")
 
+    def test_invalid_numeric_fields_raise(self):
+        with pytest.raises(ValueError, match="dim must be positive"):
+            gqa_cfg(dim=0)
+        with pytest.raises(ValueError, match="act_threshold must be in the interval"):
+            gqa_cfg(act_threshold=1.1)
+
 
 class TestOpenMythosIntrospection:
     def test_describe_matches_config_profile(self):

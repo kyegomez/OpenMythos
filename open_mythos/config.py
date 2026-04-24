@@ -73,6 +73,50 @@ class MythosConfig:
             raise ValueError(
                 f"Unsupported attn_type {self.attn_type!r}; expected 'gqa' or 'mla'"
             )
+        if self.vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
+        if self.dim <= 0:
+            raise ValueError("dim must be positive")
+        if self.n_heads <= 0:
+            raise ValueError("n_heads must be positive")
+        if self.n_kv_heads <= 0:
+            raise ValueError("n_kv_heads must be positive")
+        if self.max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive")
+        if self.max_loop_iters <= 0:
+            raise ValueError("max_loop_iters must be positive")
+        if self.prelude_layers < 0:
+            raise ValueError("prelude_layers must be non-negative")
+        if self.coda_layers < 0:
+            raise ValueError("coda_layers must be non-negative")
+        if self.kv_lora_rank <= 0:
+            raise ValueError("kv_lora_rank must be positive")
+        if self.q_lora_rank <= 0:
+            raise ValueError("q_lora_rank must be positive")
+        if self.qk_rope_head_dim <= 0:
+            raise ValueError("qk_rope_head_dim must be positive")
+        if self.qk_nope_head_dim <= 0:
+            raise ValueError("qk_nope_head_dim must be positive")
+        if self.v_head_dim <= 0:
+            raise ValueError("v_head_dim must be positive")
+        if self.n_experts <= 0:
+            raise ValueError("n_experts must be positive")
+        if self.n_shared_experts < 0:
+            raise ValueError("n_shared_experts must be non-negative")
+        if self.n_experts_per_tok <= 0:
+            raise ValueError("n_experts_per_tok must be positive")
+        if self.expert_dim <= 0:
+            raise ValueError("expert_dim must be positive")
+        if not 0.0 < self.act_threshold <= 1.0:
+            raise ValueError("act_threshold must be in the interval (0, 1]")
+        if self.rope_theta <= 0:
+            raise ValueError("rope_theta must be positive")
+        if self.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive")
+        if self.max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        if self.dropout < 0:
+            raise ValueError("dropout must be non-negative")
 
     def to_dict(self) -> dict[str, object]:
         """Return a plain-Python config dictionary for serialization."""
