@@ -15,7 +15,7 @@
 
 ## High-level architecture
 
-- `open_mythos/main.py` is the primary implementation. It defines `MythosConfig`, both attention backends, the MoE FFN, the recurrent block, and the top-level `OpenMythos` model.
+- `open_mythos/config.py` defines `MythosConfig`. `open_mythos/main.py` is the primary implementation for both attention backends, the MoE FFN, the recurrent block, and the top-level `OpenMythos` model.
 - The model pipeline is fixed: token embedding -> Prelude (`cfg.prelude_layers` dense `TransformerBlock`s run once) -> Recurrent Block (one shared `TransformerBlock` looped `n_loops` times with LoRA, ACT halting, and LTI-stable input injection) -> Coda (`cfg.coda_layers` dense `TransformerBlock`s run once) -> `RMSNorm` -> tied LM head.
 - The key architectural invariant is that the encoded input `e` is frozen after the Prelude and injected on every recurrent iteration. The recurrent update path is `loop_index_embedding -> TransformerBlock(use_moe=True) -> LoRAAdapter -> LTIInjection -> ACTHalting`.
 - `cfg.attn_type` switches the whole attention/cache path. `GQAttention` stores full K/V by layer, while `MLAttention` stores compressed `c_kv` plus `k_rope` and reconstructs K/V on demand. `OpenMythos.forward()` also switches RoPE buffers based on `attn_type`.

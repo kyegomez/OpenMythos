@@ -68,6 +68,12 @@ class MythosConfig:
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.attn_type not in {"gqa", "mla"}:
+            raise ValueError(
+                f"Unsupported attn_type {self.attn_type!r}; expected 'gqa' or 'mla'"
+            )
+
     def to_dict(self) -> dict[str, object]:
         """Return a plain-Python config dictionary for serialization."""
         return asdict(self)

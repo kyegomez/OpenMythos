@@ -569,6 +569,10 @@ class TestMythosConfigIntrospection:
         assert data["max_output_tokens"] == 256
         assert data["attn_type"] == "gqa"
 
+    def test_invalid_attn_type_raises(self):
+        with pytest.raises(ValueError, match="Unsupported attn_type"):
+            gqa_cfg(attn_type="mlaa")
+
 
 class TestOpenMythosIntrospection:
     def test_describe_matches_config_profile(self):
