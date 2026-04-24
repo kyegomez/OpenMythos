@@ -1,79 +1,120 @@
 [build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
-
-[tool.poetry]
+[project]
 name = "open-mythos"
-version = "0.4.0"
-description = "OpenMythos — open-source theoretical reconstruction of the Claude Mythos Recurrent-Depth Transformer architecture"
-license = "MIT"
-authors = ["Kye Gomez <kye@swarms.world>"]
-homepage = "https://github.com/The-Swarm-Corporation/OpenMythos"
-documentation = "https://github.com/The-Swarm-Corporation/OpenMythos/blob/main/docs/open_mythos.md"
+version = "1.0.0"
+description = "Enhanced Hermes-Style Agent System"
 readme = "README.md"
-repository = "https://github.com/The-Swarm-Corporation/OpenMythos"
-keywords = [
-    "artificial intelligence",
-    "deep learning",
-    "transformers",
-    "recurrent transformers",
-    "looped transformers",
-    "mixture of experts",
-    "multi-latent attention",
-    "grouped query attention",
-    "adaptive computation time",
-    "recurrent depth transformer",
-    "LTI stability",
-    "inference-time scaling",
+license = {text = "MIT"}
+authors = [
+    {name = "OpenMythos Team", email = "contact@openmythos.dev"}
 ]
+keywords = ["agent", "ai", "hermes", "memory", "context", "evolution", "mcp", "tool"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9.0",
+    "requests>=2.31.0",
 ]
 
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.18.0"]
+openai = ["openai>=1.12.0"]
+all = [
+    "anthropic>=0.18.0",
+    "openai>=1.12.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.7.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-torch = "2.11.0"
-transformers = ">=4.40.0"
-datasets = ">=2.18.0"
+[project.urls]
+Homepage = "https://github.com/openmythos/open-mythos"
+Documentation = "https://github.com/openmythos/open-mythos#readme"
+Repository = "https://github.com/openmythos/open-mythos"
+Issues = "https://github.com/openmythos/open-mythos/issues"
 
+[project.scripts]
+mythos = "open_mythos.cli.main:main"
 
-[tool.poetry.group.lint.dependencies]
-black = ">=23.1,<27.0"
-ruff = ">=0.5.1,<0.15.9"
-
-
-[tool.poetry.group.test.dependencies]
-pytest = ">=8.1.1,<10.0.0"
-
-[tool.poetry.group.dev.dependencies]
-black = "*"
-ruff = "*"
-pytest = "*"
-
-[tool.ruff]
-line-length = 88
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["open_mythos*"]
+exclude = ["tests", "tests.*", "docs"]
 
 [tool.black]
-target-version = ["py310"]
-line-length = 88
+line-length = 100
+target-version = ["py310", "py311", "py312"]
 include = '\.pyi?$'
-exclude = '''
-/(
-    \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-  | docs
-)/
-'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "W", "I", "N", "D", "UP", "YTT", "ANN", "S", "BLE", "FBT", "B", "A", "COM", "C4", "DTZ", "T10", "DJ", "EM", "EXE", "ISC", "ICN", "G", "INP", "PIE", "T20", "PYI", "PT", "Q", "RSE", "RET", "SLF", "SIM", "TID", "TCH", "ARG", "PTH", "ERA", "PD", "PGH", "PL", "TRY", "RUF"]
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D107", "D203", "D212", "ANN101", "ANN102", "ANN401", "T201", "T203"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "aiohttp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "requests.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["open_mythos/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["open_mythos"]
+omit = [
+    "*/tests/*",
+    "*/tests.py",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

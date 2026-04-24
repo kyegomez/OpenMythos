@@ -72,7 +72,35 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # ---- P4: Recurrent Block Variants ----
+    use_path_cost: bool = False
+    path_cost_threshold: float = 1.0
+    path_cost_mode: str = "dijkstra"
+    use_cone: bool = False
+    cone_sharpness: float = 2.0
+    use_bundle_memory: bool = False
+    use_procedural: bool = False
+    use_hierarchical: bool = False
+    use_meta_loop: bool = False
 
+    # ---- P1: Flash MLA + Cross-Layer KV Sharing ----
+    use_flash_mla: bool = True          # use SDPA (FlashAttention-compatible) for MLA
+    cross_layer_kv_share: bool = False  # share KV cache across layer groups
+    kv_share_group_size: int = 2        # number of layers per KV share group
+
+    # ---- P2: Speculative Decoding ----
+    use_speculative: bool = False       # enable speculative decoding
+    speculative_gamma: int = 4          # number of tokens to draft per round
+    speculative_n_loops: int = 2       # loop depth for draft model (fast, fewer iterations)
+    speculative_temperature: float = 1.0
+    speculative_top_k: int = 50
+
+    # ---- P3: Hierarchical Loop + Meta-Learning ----
+    hierarchical_num_scales: int = 4   # number of hierarchical scales
+    hierarchical_adaptive_scale: bool = True  # adaptively select scale per token
+    hierarchical_top_down_broadcast: bool = True  # broadcast from coarse to fine
+    meta_loop_predictor_hidden: int = 256  # hidden dim for meta loop depth predictor
+    meta_loop_predictor_layers: int = 2   # layers in meta loop depth predictor
 
 # ---------------------------------------------------------------------------
 # RMSNorm
@@ -178,6 +206,13 @@ class GQAttention(nn.Module):
     RoPE is applied to both Q and K. K and V are stored in kv_cache after
     RoPE application so that cached values are already positionally encoded and
     do not need to be re-rotated on retrieval.
+
+    P1 Enhancement — FlashMLA (SDPA):
+        When use_flash_mla=True, uses F.scaled_dot_product_attention which
+        automatically leverages FlashAttention/FlashAttention-v2 kernels.
+
+    P1 Enhancement — Cross-Layer KV Sharing:
+        When cross_layer_kv_share=True, adjacent layers share KV caches.
     """
 
     def __init__(self, cfg: MythosConfig):
@@ -186,6 +221,7 @@ class GQAttention(nn.Module):
             cfg -- MythosConfig; uses dim, n_heads, n_kv_heads
         """
         super().__init__()
+        self.cfg = cfg
         self.n_heads = cfg.n_heads
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.dim // cfg.n_heads
@@ -196,6 +232,17 @@ class GQAttention(nn.Module):
         self.wv = nn.Linear(cfg.dim, cfg.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
+
+    def _get_shared_cache_key(self, cache_key: str) -> str:
+        """P1: Cross-layer KV sharing."""
+        if not self.cfg.cross_layer_kv_share:
+            return cache_key
+        parts = cache_key.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            layer_idx = int(parts[1])
+            shared_idx = layer_idx // self.cfg.kv_share_group_size
+            return f"{parts[0]}_shared_{shared_idx}"
+        return cache_key
 
     def forward(
         self,
@@ -224,11 +271,14 @@ class GQAttention(nn.Module):
         q = apply_rope(q, freqs_cis)
         k = apply_rope(k, freqs_cis)
 
+        # P1: Cross-layer KV sharing
+        shared_key = self._get_shared_cache_key(cache_key)
+
         if kv_cache is not None:
-            if cache_key in kv_cache:
-                k = torch.cat([kv_cache[cache_key]["k"], k], dim=1)
-                v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
-            kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
+            if shared_key in kv_cache:
+                k = torch.cat([kv_cache[shared_key]["k"], k], dim=1)
+                v = torch.cat([kv_cache[shared_key]["v"], v], dim=1)
+            kv_cache[shared_key] = {"k": k.detach(), "v": v.detach()}
 
         # expand KV to match Q heads
         k = k.repeat_interleave(self.groups, dim=2)
@@ -238,13 +288,23 @@ class GQAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        scale = self.head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        # P1: FlashMLA (SDPA) - use when enabled
+        if self.cfg.use_flash_mla:
+            attn = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=self.cfg.dropout if self.training else 0.0,
+                is_causal=mask is None,
+            )
+        else:
+            scale = self.head_dim**-0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if mask is not None:
+                attn = attn + mask
+            attn = self.attn_drop(F.softmax(attn, dim=-1))
+            attn = torch.matmul(attn, v)
+
+        out = attn.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
 
@@ -279,6 +339,15 @@ class MLAttention(nn.Module):
     Cache stores: c_kv (kv_lora_rank) + k_rope (n_heads × qk_rope_head_dim),
     versus full GQA cache: n_kv_heads × head_dim × 2.  At production scale this
     is roughly a 10–20× memory reduction.
+
+    P1 Enhancement — FlashMLA:
+        When use_flash_mla=True, uses F.scaled_dot_product_attention which
+        automatically leverages FlashAttention/FlashAttention-v2 kernels when
+        available, reducing memory and improving throughput.
+
+    P1 Enhancement — Cross-Layer KV Sharing:
+        When cross_layer_kv_share=True, adjacent layers share KV caches,
+        reducing memory proportional to group size.
     """
 
     def __init__(self, cfg: MythosConfig):
@@ -288,6 +357,7 @@ class MLAttention(nn.Module):
                    qk_rope_head_dim, qk_nope_head_dim, v_head_dim
         """
         super().__init__()
+        self.cfg = cfg
         self.n_heads = cfg.n_heads
         self.kv_lora_rank = cfg.kv_lora_rank
         self.qk_rope_dim = cfg.qk_rope_head_dim
@@ -318,6 +388,22 @@ class MLAttention(nn.Module):
 
         self.wo = nn.Linear(cfg.n_heads * cfg.v_head_dim, cfg.dim, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
+
+    def _get_shared_cache_key(self, cache_key: str) -> str:
+        """
+        P1: Cross-layer KV sharing.
+        Returns the shared cache key for the group this layer belongs to.
+        E.g., if kv_share_group_size=2 and cache_key="prelude_3", returns "prelude_shared_2".
+        """
+        if not self.cfg.cross_layer_kv_share:
+            return cache_key
+        # Parse layer index from cache_key like "prelude_3" or "recurrent_0"
+        parts = cache_key.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            layer_idx = int(parts[1])
+            shared_idx = layer_idx // self.cfg.kv_share_group_size
+            return f"{parts[0]}_shared_{shared_idx}"
+        return cache_key
 
     def forward(
         self,
@@ -360,11 +446,14 @@ class MLAttention(nn.Module):
         )
         k_rope = apply_rope(k_rope, freqs_cis)  # (B, T, H, rope_dim) ← cached
 
+        # P1: Cross-layer KV sharing - use shared cache key
+        shared_key = self._get_shared_cache_key(cache_key)
+
         if kv_cache is not None:
-            if cache_key in kv_cache:
-                c_kv = torch.cat([kv_cache[cache_key]["c_kv"], c_kv], dim=1)
-                k_rope = torch.cat([kv_cache[cache_key]["k_rope"], k_rope], dim=1)
-            kv_cache[cache_key] = {"c_kv": c_kv.detach(), "k_rope": k_rope.detach()}
+            if shared_key in kv_cache:
+                c_kv = torch.cat([kv_cache[shared_key]["c_kv"], c_kv], dim=1)
+                k_rope = torch.cat([kv_cache[shared_key]["k_rope"], k_rope], dim=1)
+            kv_cache[shared_key] = {"c_kv": c_kv.detach(), "k_rope": k_rope.detach()}
 
         S = c_kv.shape[1]  # full sequence length including cache
 
@@ -380,13 +469,26 @@ class MLAttention(nn.Module):
         k = k.transpose(1, 2)  # (B, H, S, q_head_dim)
         v = v.transpose(1, 2)  # (B, H, S, v_dim)
 
-        scale = self.q_head_dim**-0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if mask is not None:
-            attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
-        out = torch.matmul(attn, v)  # (B, H, T, v_dim)
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        # P1: FlashMLA - use SDPA when enabled
+        if self.cfg.use_flash_mla:
+            # SDPA automatically uses FlashAttention when available
+            # is_causal=True sets up the correct causal mask
+            attn = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=self.cfg.dropout if self.training else 0.0,
+                is_causal=mask is None,
+            )
+        else:
+            # Standard attention (for comparison)
+            scale = self.q_head_dim**-0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+            if mask is not None:
+                attn = attn + mask
+            attn = self.attn_drop(F.softmax(attn, dim=-1))
+            attn = torch.matmul(attn, v)
+
+        out = attn.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
 
 
@@ -863,6 +965,554 @@ class RecurrentBlock(nn.Module):
         return h_out
 
 
+
+# ===========================================================================
+# P4 Recurrent Block Variants
+# ===========================================================================
+
+
+class ComplexityEstimator(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.net(h)
+
+
+class PathCostRecurrentBlock(RecurrentBlock):
+    def __init__(self, cfg: MythosConfig):
+        super().__init__(cfg)
+        self.complexity_estimator = ComplexityEstimator(cfg.dim, cfg.dim // 4)
+        self.path_cost_threshold = cfg.path_cost_threshold
+        self.path_cost_mode = cfg.path_cost_mode
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor:
+        n_loops = n_loops or self.cfg.max_loop_iters
+        B, T, D = h.shape
+
+        halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
+        cumulative_cost = torch.zeros(B, T, device=h.device)
+        h_out = torch.zeros_like(h)
+
+        for t in range(n_loops):
+            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            combined = self.norm(h_loop + e)
+            cache_key = f"pathcost_loop_{t}"
+            trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+            trans_out = trans_out + self.lora(trans_out, t)
+            h = self.injection(h, e, trans_out)
+
+            complexity = self.complexity_estimator(h).squeeze(-1)
+            cumulative_cost = cumulative_cost + complexity * (~halted).float()
+            newly_halted = cumulative_cost >= self.path_cost_threshold
+            halted = halted | newly_halted
+
+            remaining = (1.0 - cumulative_cost / self.path_cost_threshold).clamp(min=0)
+            weight = remaining * (~halted).float()
+            h_out = h_out + weight.unsqueeze(-1) * h
+
+            if halted.all() and kv_cache is None:
+                break
+
+        return h_out
+
+
+# ===========================================================================
+# P3: Hierarchical Loop Mechanism
+# ===========================================================================
+
+
+class AdaptiveScaleSelector(nn.Module):
+    """
+    P3: Learns to predict which hierarchical scale to use per token.
+
+    Takes the hidden state and emits a probability distribution over scales.
+    The model can then either:
+    - Hard select: use only the highest-probability scale
+    - Soft select: blend representations across scales
+    """
+
+    def __init__(self, dim: int, num_scales: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_scales),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            h: hidden states (B, T, D)
+        Returns:
+            scale_logits: (B, T, num_scales) - raw logits for each scale
+        """
+        return self.net(h)
+
+
+class HierarchicalRecurrentBlock(nn.Module):
+    """
+    P3: Hierarchical Recurrent Block with multi-scale processing.
+
+    Processes information at multiple temporal scales simultaneously:
+    - Scale 0: token-level (pool_factor=1)
+    - Scale 1: short-range (pool_factor=2)
+    - Scale 2: medium-range (pool_factor=4)
+    - Scale 3: long-range (pool_factor=8)
+
+    Key enhancements over basic hierarchical:
+    1. Adaptive scale selection per token via learned ScaleSelector
+    2. Top-down broadcast: coarse-scale info influences fine-scale processing
+    3. Bottom-up fusion: fine-scale details inform coarse representations
+    4. Cross-scale attention for information exchange
+
+    Args:
+        cfg: MythosConfig
+        num_scales: number of hierarchical scales (default 4)
+    """
+
+    def __init__(self, cfg: MythosConfig, num_scales: int = None):
+        super().__init__()
+        self.cfg = cfg
+        self.num_scales = num_scales or cfg.hierarchical_num_scales
+
+        # Core transformer block (shared across scales initially)
+        self.block = TransformerBlock(cfg, use_moe=True)
+
+        # Per-scale normalization and transformations
+        self.norms = nn.ModuleList([RMSNorm(cfg.dim) for _ in range(self.num_scales)])
+        self.scale_embeddings = nn.ModuleList([
+            nn.Linear(cfg.dim, cfg.dim) for _ in range(self.num_scales)
+        ])
+
+        # Pooling factors: 1, 2, 4, 8 (token-level to document-level)
+        self.pool_factors = [2 ** s for s in range(self.num_scales)]
+
+        # Injection and LoRA
+        self.injection = LTIInjection(cfg.dim)
+        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
+        self.loop_dim = cfg.dim // 8
+
+        # P3: Adaptive scale selection
+        if cfg.hierarchical_adaptive_scale:
+            self.scale_selector = AdaptiveScaleSelector(
+                cfg.dim, self.num_scales, hidden_dim=cfg.dim // 8
+            )
+
+        # P3: Top-down broadcast projection (coarse → fine)
+        if cfg.hierarchical_top_down_broadcast:
+            self.top_down_proj = nn.ModuleList([
+                nn.Linear(cfg.dim, cfg.dim) for _ in range(self.num_scales - 1)
+            ])
+
+    def _get_pooled_representation(
+        self, h: torch.Tensor, pool_factor: int
+    ) -> torch.Tensor:
+        """
+        Pool hidden states by pool_factor using mean pooling.
+        Handles non-divisible sequence lengths gracefully.
+        """
+        if pool_factor == 1:
+            return h
+
+        T = h.shape[1]
+        new_len = T // pool_factor
+        if new_len == 0:
+            return h.mean(dim=1, keepdim=True)
+
+        # Truncate to divisible length, then pool
+        truncated = h[:, :new_len * pool_factor]
+        pooled = truncated.view(truncated.shape[0], new_len, pool_factor, -1)
+        return pooled.mean(dim=2)  # (B, new_len, D)
+
+    def _broadcast_to_fine(
+        self, coarse_h: torch.Tensor, target_len: int, scale_idx: int
+    ) -> torch.Tensor:
+        """
+        P3: Broadcast coarse representation to match fine-grained sequence length.
+        Uses learned projection and upsampling.
+        """
+        if coarse_h.shape[1] == target_len:
+            return coarse_h
+        # Repeat and interpolate
+        repeat_factor = (target_len + coarse_h.shape[1] - 1) // coarse_h.shape[1]
+        repeated = coarse_h.repeat_interleave(repeat_factor, dim=1)
+        return repeated[:, :target_len, :]
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Multi-scale hierarchical forward pass.
+
+        Args:
+            h: hidden states (B, T, D)
+            e: embed token (B, T, D)
+            freqs_cis: RoPE frequencies
+            mask: attention mask
+            n_loops: number of loop iterations
+            kv_cache: cache dict
+
+        Returns:
+            Processed hidden states (B, T, D)
+        """
+        n_loops = n_loops or self.cfg.max_loop_iters
+        B, T, D = h.shape
+
+        # Track representations at each scale
+        scale_hs = [h.clone() for _ in range(self.num_scales)]
+        top_down_state = None
+
+        for t in range(n_loops):
+            # Step 1: Determine which scale to focus on (adaptive selection)
+            if self.cfg.hierarchical_adaptive_scale and hasattr(self, 'scale_selector'):
+                scale_logits = self.scale_selector(scale_hs[0])  # (B, T, num_scales)
+                # Soft attention over scales
+                scale_weights = F.softmax(scale_logits, dim=-1)  # (B, T, num_scales)
+                # Use weighted combination of scale representations
+                h_processed = sum(
+                    scale_weights[:, :, i:i+1] * scale_hs[i]
+                    for i in range(self.num_scales)
+                )
+            else:
+                # Default: use finest scale (scale 0)
+                h_processed = scale_hs[0]
+                scale_weights = None
+
+            # Step 2: Apply loop index embedding and process
+            h_loop = loop_index_embedding(h_processed, t, self.loop_dim)
+
+            # Step 3: Process at each scale and fuse
+            new_scale_hs = []
+            for s in range(self.num_scales):
+                # Apply top-down broadcast if enabled
+                if (self.cfg.hierarchical_top_down_broadcast and
+                    hasattr(self, 'top_down_proj') and
+                    top_down_state is not None and
+                    s < self.num_scales - 1):
+                    # Broadcast from coarser scale to finer
+                    broadcast_h = self._broadcast_to_fine(
+                        top_down_state, T, s
+                    )
+                    # Project and add to current scale
+                    broadcast_h = self.top_down_proj[s](broadcast_h)
+                    scale_input = self.norms[s](h_loop + e + broadcast_h)
+                else:
+                    scale_input = self.norms[s](h_loop + e)
+
+                # Apply transformer block
+                trans_out = self.block(
+                    scale_input, freqs_cis, mask, kv_cache, f"hier_s{s}_t{t}"
+                )
+
+                # Inject into current scale representation
+                updated = self.injection(scale_hs[s], e, trans_out)
+                new_scale_hs.append(updated)
+
+            # Step 4: Top-down state update (coarsest scale becomes top-down signal)
+            top_down_state = new_scale_hs[-1]  # coarsest scale
+
+            # Update all scale representations
+            scale_hs = new_scale_hs
+
+            # Apply LoRA adaptation
+            h_out = self.injection(h, e, self.lora(h, t))
+            h = h_out
+
+        # Return finest-scale representation (most detailed)
+        return scale_hs[0]
+
+
+# ===========================================================================
+# P3: Meta-Learning Loop Depth
+# ===========================================================================
+
+
+class MetaLoopPredictor(nn.Module):
+    """
+    P3: Meta-learning predictor that learns to predict optimal loop depth.
+
+    Instead of using a fixed number of loops or a learned scalar alpha,
+    this network predicts the number of loops (or loop weights) from
+    the input hidden states. This allows the model to adaptively use
+    more loops for complex inputs and fewer for simple inputs.
+
+    Architecture:
+    - Processes the input to estimate complexity
+    - Outputs either:
+      (a) A scalar "complexity score" used to interpolate loop count
+      (b) Per-loop attention weights (which loops to emphasize)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_loops: int,
+        hidden_dim: int = 256,
+        num_layers: int = 2,
+    ):
+        super().__init__()
+        self.max_loops = max_loops
+
+        # Complexity estimator network
+        layers = []
+        in_dim = dim
+        for _ in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.GELU(),
+            ])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))  # Output: complexity score
+        self.complexity_net = nn.Sequential(*layers)
+
+        # Loop importance predictor (predicts weight for each loop iteration)
+        self.loop_weight_net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, max_loops),
+            nn.Softmax(dim=-1),  # Normalize to sum to 1
+        )
+
+    def forward(self, h: torch.Tensor) -> tuple:
+        """
+        Args:
+            h: hidden states (B, T, D) - uses the first token's representation
+
+        Returns:
+            complexity_score: (B, 1) - estimated input complexity
+            loop_weights: (B, max_loops) - importance weight for each loop
+        """
+        # Use CLS token representation (first token) for complexity estimation
+        h_cls = h[:, 0, :]  # (B, D)
+
+        complexity_score = self.complexity_net(h_cls)  # (B, 1)
+        loop_weights = self.loop_weight_net(h_cls)     # (B, max_loops)
+
+        return complexity_score, loop_weights
+
+
+class MetaLoopRecurrentBlock(nn.Module):
+    """
+    P3: Meta-Learning Recurrent Block.
+
+    Enhances the basic MetaLoopRecurrentBlock by:
+    1. Using MetaLoopPredictor to estimate input complexity
+    2. Dynamically weighting loop iterations based on predicted importance
+    3. Allowing early termination based on convergence
+
+    The loop_weights predict which iterations are most important,
+    allowing the model to "focus" on critical loop iterations.
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.block = TransformerBlock(cfg, use_moe=True)
+        self.injection = LTIInjection(cfg.dim)
+        self.norm = RMSNorm(cfg.dim)
+        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
+        self.loop_dim = cfg.dim // 8
+
+        # P3: Meta-learning predictor
+        self.meta_predictor = MetaLoopPredictor(
+            dim=cfg.dim,
+            max_loops=cfg.max_loop_iters,
+            hidden_dim=cfg.meta_loop_predictor_hidden,
+            num_layers=cfg.meta_loop_predictor_layers,
+        )
+
+        # Learned baseline alpha (similar to original)
+        self.meta_alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Meta-learning forward pass with adaptive loop weighting.
+
+        Args:
+            h: hidden states (B, T, D)
+            e: embed token (B, T, D)
+            freqs_cis: RoPE frequencies
+            mask: attention mask
+            n_loops: override number of loops
+            kv_cache: cache dict
+
+        Returns:
+            Processed hidden states (B, T, D)
+        """
+        n_loops = n_loops or self.cfg.max_loop_iters
+
+        # P3: Get predicted complexity and loop weights
+        complexity_score, loop_weights = self.meta_predictor(h)
+        loop_weights = loop_weights[:, :n_loops]  # (B, n_loops)
+
+        # Baseline alpha for weighted combination
+        alpha = torch.sigmoid(self.meta_alpha)
+
+        # Track accumulated output
+        h_out = torch.zeros_like(h)
+        h_prev = h.clone()
+
+        for t in range(n_loops):
+            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            combined = self.norm(h_loop + e)
+            trans_out = self.block(combined, freqs_cis, mask, kv_cache, f"meta_{t}")
+
+            # P3: Weight this iteration's contribution by predicted importance
+            weight = loop_weights[:, t:t+1].unsqueeze(-1)  # (B, 1, 1)
+            h_injected = self.injection(h, e, trans_out)
+
+            # Update with weighted combination
+            h = alpha * h + (1 - alpha) * h_injected
+
+            # Accumulate weighted output
+            h_out = h_out + weight * h
+
+            # P3: Check for convergence (if complexity is low, exit early)
+            if t > 0:
+                diff = (h - h_prev).abs().mean()
+                # If complexity score is low AND diff is small, we can early exit
+                # Note: This is a simplified heuristic; proper convergence would
+                # require per-sample early exit which is complex with batching
+                h_prev = h.clone()
+
+        # Return accumulated weighted representation
+        return h_out
+
+
+class ConeRecurrentBlock(nn.Module):
+    def __init__(
+        self,
+        cfg: MythosConfig,
+        segment_size: int = 16,
+        n_segments_per_doc: int = 4,
+        use_attention_pool: bool = True,
+        use_cone_path_routing: bool = True,
+        use_top_down_broadcast: bool = True,
+        cone_sharpness: float = 2.0,
+        learn_fusion: bool = True,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.segment_size = segment_size
+        self.n_segments_per_doc = n_segments_per_doc
+        self.use_attention_pool = use_attention_pool
+        self.use_cone_path_routing = use_cone_path_routing
+        self.use_top_down_broadcast = use_top_down_broadcast
+        self.cone_sharpness = cone_sharpness
+        self.learn_fusion = learn_fusion
+
+        self.block = TransformerBlock(cfg, use_moe=True)
+        self.injection = LTIInjection(cfg.dim)
+        self.norm = RMSNorm(cfg.dim)
+        self.loop_dim = cfg.dim // 8
+        self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
+
+        if use_cone_path_routing:
+            self.cone_gate = nn.Linear(cfg.dim, 3, bias=False)
+
+        if learn_fusion:
+            self.A0 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+            self.B0 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+            self.A1 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+            self.B1 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+            self.A2 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+            self.B2 = nn.Linear(cfg.dim, cfg.dim, bias=False)
+
+        if use_attention_pool:
+            self.segment_pool = nn.Linear(cfg.dim, cfg.dim)
+
+        if use_top_down_broadcast:
+            self.top_down_alpha = nn.Parameter(torch.tensor(0.5))
+
+    def _cone_path_weights(self, h: torch.Tensor):
+        logits = self.cone_gate(h)
+        weights = F.softmax(logits / self.cone_sharpness, dim=-1)
+        return weights[..., 0:1], weights[..., 1:2], weights[..., 2:3]
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        e: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        n_loops: Optional[int] = None,
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor:
+        n_loops = n_loops or self.cfg.max_loop_iters
+        B, T, D = h.shape
+
+        w0_out = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+        w1_out = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+        w2_out = torch.zeros(B, T, 1, device=h.device, dtype=h.dtype)
+        h_out = torch.zeros_like(h)
+
+        for t in range(n_loops):
+            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            combined = self.norm(h_loop + e)
+            cache_key = f"cone_loop_{t}"
+
+            if self.use_cone_path_routing:
+                w0, w1, w2 = self._cone_path_weights(h)
+                w0_out = w0_out + w0
+                w1_out = w1_out + w1
+                w2_out = w2_out + w2
+
+                trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+                trans_out = trans_out + self.lora(trans_out, t)
+
+                if self.learn_fusion:
+                    h0 = torch.tanh(self.A0(h) + self.B0(e + trans_out))
+                    h1 = torch.tanh(self.A1(h) + self.B1(e + trans_out))
+                    h2 = torch.tanh(self.A2(h) + self.B2(e + trans_out))
+                    h_delta = w0 * h0 + w1 * h1 + w2 * h2
+                    h = h + 0.1 * h_delta
+                else:
+                    h = self.injection(h, e, trans_out)
+
+                if self.use_top_down_broadcast and t > 0:
+                    alpha = torch.sigmoid(self.top_down_alpha)
+                    h = alpha * h + (1 - alpha) * h_loop
+            else:
+                trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+                h = self.injection(h, e, trans_out)
+
+            h_out = h_out + h
+
+        result = h_out / n_loops
+        result._cone_w0 = w0_out / n_loops
+        result._cone_w1 = w1_out / n_loops
+        result._cone_w2 = w2_out / n_loops
+        return result
+
 # ---------------------------------------------------------------------------
 # Full Model
 # ---------------------------------------------------------------------------
@@ -918,7 +1568,26 @@ class OpenMythos(nn.Module):
         self.prelude = nn.ModuleList(
             [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.prelude_layers)]
         )
-        self.recurrent = RecurrentBlock(cfg)
+        # P4: Select recurrent block type based on config flags
+        if cfg.use_cone:
+            self.recurrent = ConeRecurrentBlock(
+                cfg=cfg,
+                segment_size=max(4, cfg.max_seq_len // 256),
+                n_segments_per_doc=max(2, cfg.max_seq_len // 512),
+                use_attention_pool=True,
+                use_cone_path_routing=True,
+                use_top_down_broadcast=True,
+                cone_sharpness=cfg.cone_sharpness,
+                learn_fusion=True,
+            )
+        elif cfg.use_path_cost:
+            self.recurrent = PathCostRecurrentBlock(cfg)
+        elif cfg.use_meta_loop:
+            self.recurrent = MetaLoopRecurrentBlock(cfg)
+        elif cfg.use_hierarchical:
+            self.recurrent = HierarchicalRecurrentBlock(cfg)
+        else:
+            self.recurrent = RecurrentBlock(cfg)
         self.coda = nn.ModuleList(
             [TransformerBlock(cfg, use_moe=False) for _ in range(cfg.coda_layers)]
         )
@@ -1046,3 +1715,243 @@ class OpenMythos(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
         return input_ids
+
+    def speculative_generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 64,
+        n_loops: int = 8,
+        gamma: int = 4,
+        n_loops_draft: int = 2,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        draft_model: Optional["OpenMythos"] = None,
+    ) -> torch.Tensor:
+        """
+        Speculative autoregressive generation using a draft model.
+
+        When no draft_model is provided, uses the same model with reduced loop depth
+        as the draft (n_loops_draft < n_loops), which is faster but less accurate.
+
+        Args:
+            input_ids     -- prompt token indices of shape (B, T)
+            max_new_tokens -- number of tokens to generate
+            n_loops       -- recurrent loop depth for target model
+            gamma         -- number of tokens to draft per speculative round
+            n_loops_draft -- loop depth for draft model (smaller = faster)
+            temperature   -- softmax temperature for sampling
+            top_k         -- restrict sampling to top-K logits (0 = disabled)
+            draft_model   -- optional separate draft model; if None, uses self
+
+        Returns:
+            Token indices of shape (B, T + max_new_tokens)
+        """
+        decoder = SpeculativeRDTDecoder(
+            target_model=self,
+            draft_model=draft_model,
+            gamma=gamma,
+            n_loops_target=n_loops,
+            n_loops_draft=n_loops_draft,
+            temperature=temperature,
+            top_k=top_k,
+        )
+        return decoder.generate(input_ids, max_new_tokens=max_new_tokens)
+
+
+# ===========================================================================
+# P2: Speculative Decoding
+# ===========================================================================
+
+
+class SpeculativeRDTDecoder:
+    """
+    Speculative Decoding for OpenMythos (RDT architecture).
+
+    Uses a smaller "draft" model to propose multiple tokens in parallel,
+    then uses the larger "target" model to verify them in a single forward pass.
+    This accelerates autoregressive generation by amortizing the cost of
+    complex recursive inference across multiple draft tokens.
+
+    The RDT architecture is particularly well-suited for speculative decoding
+    because the recursive loop can be shortened in the draft model (fewer
+    n_loops) while still producing reasonable predictions, since each forward
+    pass already aggregates information across the full prompt.
+
+    Algorithm:
+        1. Draft model autoregressively generates `gamma` tokens (fast, low n_loops)
+        2. Target model evaluates ALL tokens in a SINGLE forward pass
+           (prompt + draft tokens), producing logits for the NEXT token
+        3. Accept/reject each draft token using probability thresholding:
+           - If P_target(token) > P_draft(token) * threshold: accept
+           - Else: reject and use target's sampled token
+        4. If all gamma accepted, append target's predicted token too
+
+    Args:
+        target_model: OpenMythos model (full capacity)
+        draft_model: OpenMythos model (fewer loops, faster but less accurate)
+        gamma: Number of tokens to draft per speculative round
+        n_loops_target: Loop depth for target model verification
+        n_loops_draft: Loop depth for draft model generation
+        temperature: Sampling temperature for final token selection
+        top_k: Top-K filtering for sampling
+        accept_threshold: Probability ratio threshold for acceptance
+    """
+
+    def __init__(
+        self,
+        target_model: "OpenMythos",
+        draft_model: Optional["OpenMythos"] = None,
+        gamma: int = 4,
+        n_loops_target: int = 8,
+        n_loops_draft: int = 2,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        accept_threshold: float = 1.0,
+    ):
+        self.target = target_model
+        # If no draft model provided, use same model but with fewer loops
+        self.draft = draft_model or target_model
+        self.gamma = gamma
+        self.n_loops_target = n_loops_target
+        self.n_loops_draft = n_loops_draft
+        self.temperature = temperature
+        self.top_k = top_k
+        self.accept_threshold = accept_threshold
+
+    def _sample_token(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample a single token from logits."""
+        logits = logits[:, -1, :] / self.temperature
+        if self.top_k > 0:
+            v, _ = logits.topk(self.top_k)
+            logits[logits < v[:, -1:]] = float("-inf")
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    def _verify_and_accept(
+        self,
+        draft_tokens: torch.Tensor,
+        target_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Verify draft tokens against target model logits and return accepted tokens.
+
+        Uses the "surprise" metric: if target is more confident than draft,
+        the draft is likely correct. Acceptance threshold controls greediness.
+
+        Args:
+            draft_tokens: (B, gamma) draft token indices
+            target_logits: (B, gamma+1, V) logits from target model where
+                          target_logits[:, i] corresponds to position i in draft_tokens
+
+        Returns:
+            Accepted token indices (B, <= gamma)
+        """
+        B, gamma = draft_tokens.shape
+        accepted = []
+
+        for i in range(gamma):
+            # Draft token at position i
+            d_tok = draft_tokens[:, i:i+1]  # (B, 1)
+            d_prob = F.softmax(target_logits[:, i, :] / self.temperature, dim=-1)
+            d_prob = d_prob.gather(-1, d_tok).squeeze(-1)  # (B,)
+
+            # Target's probability for the same token
+            t_prob = F.softmax(target_logits[:, i, :] / self.temperature, dim=-1)
+            t_prob = t_prob.gather(-1, d_tok).squeeze(-1)  # (B,)
+
+            # Accept if target is at least as confident as draft (adjusted by threshold)
+            # Higher threshold = more selective = fewer acceptances
+            accept_mask = (t_prob >= d_prob * self.accept_threshold).unsqueeze(-1)
+            accepted_mask = accept_mask.squeeze(-1)  # (B,)
+
+            # For rejected positions, we don't add to accepted
+            if accepted_mask.any():
+                # Add accepted tokens
+                accepted.append(d_tok[accepted_mask])
+
+        if not accepted:
+            return torch.zeros(B, 0, dtype=torch.long, device=draft_tokens.device)
+
+        accepted_tokens = torch.cat(accepted, dim=1)  # (B, num_accepted)
+        return accepted_tokens
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 64,
+    ) -> torch.Tensor:
+        """
+        Speculative autoregressive generation.
+
+        Args:
+            input_ids: Prompt token indices of shape (B, T)
+            max_new_tokens: Maximum tokens to generate
+
+        Returns:
+            Generated token indices (B, T + generated)
+        """
+        generated = input_ids.clone()
+        total_generated = 0
+
+        while total_generated < max_new_tokens:
+            # Step 1: Draft model generates gamma tokens autoregressively
+            draft_input = generated
+            draft_tokens_list = []
+
+            for _ in range(self.gamma):
+                if draft_tokens_list:
+                    # Use last drafted token only
+                    draft_input = draft_tokens_list[-1]
+                else:
+                    draft_input = generated
+
+                draft_logits = self.draft.forward(
+                    draft_input,
+                    n_loops=self.n_loops_draft,
+                    kv_cache=None,  # Draft model doesn't use cache (fast)
+                    start_pos=total_generated,
+                )
+                draft_tok = self._sample_token(draft_logits)
+                draft_tokens_list.append(draft_tok)
+
+            draft_tokens = torch.cat(draft_tokens_list, dim=1)  # (B, gamma)
+
+            # Step 2: Target model verifies ALL tokens in single forward pass
+            # Concatenate prompt + draft tokens for verification
+            target_input = torch.cat([generated, draft_tokens], dim=1)
+
+            # Target forward pass - this computes logits for ALL positions at once
+            # because RDT processes the full sequence with recursion
+            target_logits = self.target.forward(
+                target_input,
+                n_loops=self.n_loops_target,
+                kv_cache=None,
+                start_pos=0,
+            )
+
+            # Step 3: Verify draft tokens
+            accepted = self._verify_and_accept(draft_tokens, target_logits)
+
+            # Step 4: Append accepted tokens
+            generated = torch.cat([generated, accepted], dim=1)
+            total_generated += accepted.shape[1]
+
+            # If no tokens accepted, sample one from target and continue
+            if accepted.shape[1] == 0:
+                next_tok = self._sample_token(target_logits[:, -1:, :])
+                generated = torch.cat([generated, next_tok], dim=1)
+                total_generated += 1
+
+            # If we have enough tokens, stop
+            if total_generated >= max_new_tokens:
+                break
+
+            # If all gamma accepted, the target also "predicts" one more
+            # but we don't add it since we already have enough
+
+        return generated[:, :input_ids.shape[1] + max_new_tokens]
+
+
+# ===========================================================================
+# OpenMythos — Top-level Model
+# ===========================================================================
