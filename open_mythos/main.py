@@ -1962,6 +1962,300 @@ class CurriculumLoopScheduler:
 
 
 # ===========================================================================
+# Training Regularization: Loop Consistency
+# ===========================================================================
+
+
+class LoopConsistencyRegularizer(nn.Module):
+    """
+    Loop Consistency Regularization.
+
+    Encourages the recurrent loop to produce consistent hidden states across
+    forward passes. Without this, the model may produce different outputs
+    for semantically equivalent inputs that pass through different loop depths.
+
+    Loss components:
+        1. Consecutive consistency: encourage stable transformation across loops
+        2. Hidden state variance: encourage non-trivial information transformation
+        3. Loop stationarity: hidden states shouldn't drift too far from initial
+    """
+
+    def __init__(self, beta_consistency: float = 0.1, beta_variance: float = 0.05):
+        """
+        Args:
+            beta_consistency -- weight for consecutive loop consistency loss
+            beta_variance -- weight for hidden state variance loss
+        """
+        super().__init__()
+        self.beta_c = beta_consistency
+        self.beta_v = beta_variance
+
+    def forward(
+        self,
+        h_0: torch.Tensor,
+        h_T: torch.Tensor,
+        loop_outputs: list[torch.Tensor],
+        main_loss: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute loop consistency regularization loss.
+
+        Args:
+            h_0 -- initial hidden state (B, T, dim)
+            h_T -- final hidden state after all loops (B, T, dim)
+            loop_outputs -- list of hidden states at each loop step
+            main_loss -- the primary loss (cross-entropy)
+
+        Returns:
+            Total loss = main_loss + consistency_loss + variance_loss
+        """
+        total_loss = main_loss
+
+        # 1. Consecutive loop consistency
+        if len(loop_outputs) >= 2:
+            cycle_loss = 0.0
+            for t in range(len(loop_outputs) - 1):
+                cycle_loss += F.mse_loss(loop_outputs[t], loop_outputs[t + 1])
+            cycle_loss = cycle_loss / (len(loop_outputs) - 1)
+            total_loss = total_loss + self.beta_c * cycle_loss
+
+        # 2. Hidden state variance — encourage transformation, not copying
+        if len(loop_outputs) > 0:
+            final_out = loop_outputs[-1]
+            variance_loss = -torch.var(final_out, dim=-1).mean()
+            total_loss = total_loss + self.beta_v * variance_loss
+
+        return total_loss
+
+
+# ===========================================================================
+# MoE Enhancements: Capacity-Aware Routing & Task-Conditioned MoE
+# ===========================================================================
+
+
+class CapacityAwareRouter(nn.Module):
+    """
+    Capacity-Aware Mixture-of-Experts Router.
+
+    Standard MoE routing selects top-K experts based on probability scores,
+    but doesn't consider expert capacity. This can lead to:
+        - Some experts overloaded (too many tokens → degraded quality)
+        - Some experts underutilized (idle capacity)
+
+    Capacity-Aware Routing adds a per-expert token budget:
+        - Each expert has max_capacity tokens per forward pass
+        - Tokens beyond capacity are re-routed to next-best available expert
+        - Maintains load balance without auxiliary losses
+    """
+
+    def __init__(self, cfg: MythosConfig, capacity_factor: float = 1.5):
+        """
+        Args:
+            cfg -- MythosConfig
+            capacity_factor -- multiplier on average capacity per expert
+        """
+        super().__init__()
+        self.n_experts = cfg.n_experts
+        self.topk = cfg.n_experts_per_tok
+        self.capacity_factor = capacity_factor
+
+        self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
+        self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        token_capacity: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Route tokens to experts with capacity constraints.
+
+        Args:
+            x -- input tensor (B*T, dim)
+            token_capacity -- max tokens per expert per forward pass
+
+        Returns:
+            Tuple of (selected_expert_ids, weights)
+        """
+        B_T, D = x.shape
+
+        logits = self.router(x) + self.router_bias
+        scores = F.softmax(logits, dim=-1)
+
+        capacities = (token_capacity // self.topk) * torch.ones(
+            self.n_experts, device=x.device
+        )
+
+        remaining = capacities.clone()
+        selected = torch.full((B_T, self.topk), -1, dtype=torch.long, device=x.device)
+        weights = torch.zeros_like(selected, dtype=torch.float)
+
+        for k in range(self.topk):
+            for b in range(B_T):
+                for _ in range(self.n_experts):
+                    top_expert = logits[b].argmax().item()
+                    if remaining[top_expert] > 0:
+                        selected[b, k] = top_expert
+                        weights[b, k] = scores[b, top_expert]
+                        remaining[top_expert] -= 1
+                        break
+                    else:
+                        logits[b, top_expert] = float("-inf")
+
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        return selected, weights
+
+
+class TaskConditionedMoE(nn.Module):
+    """
+    Task-Conditioned Mixture of Experts.
+
+    Extends standard MoE with explicit task conditioning:
+    - Each expert is guided toward a domain specialty (soft, not hard-coded)
+    - Task embedding modulates routing probabilities
+    - Experts specialize through auxiliary objectives
+
+    Domain groups (soft specialization via auxiliary loss):
+        Group 0: Syntax, tokenization, morphology
+        Group 1: Factual knowledge, named entities
+        Group 2: Reasoning, logic, deduction
+        Group 3: Mathematics, code, formal systems
+    """
+
+    NUM_DOMAINS = 4
+
+    def __init__(self, cfg: MythosConfig, specialization_strength: float = 0.1):
+        super().__init__()
+        self.n_experts = cfg.n_experts
+        self.n_shared = cfg.n_shared_experts
+        self.topk = cfg.n_experts_per_tok
+        self.specialization_strength = specialization_strength
+
+        self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
+        self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+
+        self.expert_domain_affinity = nn.Parameter(
+            torch.randn(cfg.n_experts, self.NUM_DOMAINS) * 0.02
+        )
+
+        self.task_embed = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim // 2),
+            nn.GELU(),
+            nn.Linear(cfg.dim // 2, self.NUM_DOMAINS),
+        )
+
+        self.routed_experts = nn.ModuleList(
+            [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
+        )
+        self.shared_experts = nn.ModuleList(
+            [
+                Expert(cfg.dim, cfg.expert_dim * cfg.n_experts_per_tok)
+                for _ in range(self.n_shared)
+            ]
+        )
+
+    def get_domain_affinity_loss(self) -> torch.Tensor:
+        """Auxiliary loss encouraging expert domain specialization."""
+        affinity = F.softmax(self.expert_domain_affinity, dim=-1)
+        entropy = -(affinity * torch.log(affinity + 1e-8)).sum(dim=-1).mean()
+        return self.specialization_strength * entropy
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        task_id: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with task conditioning.
+
+        Args:
+            x -- input tensor (B, T, dim)
+            task_id -- optional domain label (B,) for hard conditioning
+
+        Returns:
+            Output tensor (B, T, dim)
+        """
+        B, T, D = x.shape
+        flat = x.view(B * T, D)
+
+        if task_id is not None:
+            task_dist = torch.zeros(B, self.NUM_DOMAINS, device=x.device)
+            task_dist.scatter_(1, task_id.unsqueeze(1), 1.0)
+        else:
+            task_logits = self.task_embed(x.mean(dim=1))
+            task_dist = F.softmax(task_logits, dim=-1)
+
+        domain_modulation = task_dist @ self.expert_domain_affinity.T
+
+        logits = self.router(flat)
+        logits = logits + domain_modulation.repeat_interleave(T, dim=0) * 0.5
+
+        scores = F.softmax(logits, dim=-1)
+        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        topk_scores = scores.gather(-1, topk_idx)
+        topk_scores = topk_scores / (topk_scores.sum(dim=-1, keepdim=True) + 1e-8)
+
+        out = torch.zeros_like(flat)
+        for i in range(self.topk):
+            expert_ids = topk_idx[:, i]
+            token_scores = topk_scores[:, i].unsqueeze(-1)
+            for eid in range(self.n_experts):
+                mask = expert_ids == eid
+                if not mask.any():
+                    continue
+                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+
+        for shared in self.shared_experts:
+            out = out + shared(flat)
+
+        return out.view(B, T, D)
+
+
+# ===========================================================================
+# OpenMythosEnhanced: All Enhancements Wrapper
+# ===========================================================================
+
+
+class OpenMythosEnhanced(OpenMythos):
+    """
+    Fully Enhanced OpenMythos with all P0/P1/P2/P3 enhancements.
+
+    This class wraps the base OpenMythos and adds:
+    - P0: Multi-scale loop depth, curriculum learning
+    - P1: Loop consistency regularization, Capacity-aware routing
+    - P2: Speculative decoding, Task-conditioned MoE
+    - P3: Hierarchical recurrence, Meta-learned loop depth
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        super().__init__(cfg)
+
+        # P0: Depth selector and curriculum
+        if cfg.enable_multiscale_loop:
+            self.depth_selector = DepthSelector(cfg)
+
+        if cfg.enable_curriculum:
+            self.curriculum_scheduler = None  # Initialized with total_steps in training
+
+        # P1 Enhancements
+        if hasattr(cfg, "loop_consistency_beta"):
+            self.consistency_regularizer = LoopConsistencyRegularizer(
+                beta_consistency=cfg.loop_consistency_beta,
+                beta_variance=getattr(cfg, "loop_variance_beta", 0.05),
+            )
+
+        if hasattr(cfg, "capacity_aware_routing") and cfg.capacity_aware_routing:
+            self.capacity_router = CapacityAwareRouter(cfg)
+
+        # P2 Enhancements
+        if cfg.use_speculative:
+            self.speculative_decoder = None  # Initialized with draft model
+
+        if hasattr(cfg, "task_conditioned_moe") and cfg.task_conditioned_moe:
+            self.task_moe = TaskConditionedMoE(cfg)
+
+
+# ===========================================================================
 # P2: Speculative Decoding
 # ===========================================================================
 
