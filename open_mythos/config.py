@@ -105,6 +105,10 @@ class MythosConfig:
             raise ValueError("n_shared_experts must be non-negative")
         if self.n_experts_per_tok <= 0:
             raise ValueError("n_experts_per_tok must be positive")
+        if self.n_experts_per_tok > self.n_experts:
+            raise ValueError(
+                "n_experts_per_tok must be less than or equal to n_experts"
+            )
         if self.expert_dim <= 0:
             raise ValueError("expert_dim must be positive")
         if not 0.0 < self.act_threshold <= 1.0:
@@ -115,8 +119,8 @@ class MythosConfig:
             raise ValueError("lora_rank must be positive")
         if self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
-        if self.dropout < 0:
-            raise ValueError("dropout must be non-negative")
+        if not 0.0 <= self.dropout <= 1.0:
+            raise ValueError("dropout must be in the interval [0, 1]")
         if self.dim % self.n_heads != 0:
             raise ValueError("dim must be divisible by n_heads")
         if (self.dim // self.n_heads) % 2 != 0:

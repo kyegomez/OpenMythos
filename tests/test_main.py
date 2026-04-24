@@ -584,6 +584,10 @@ class TestMythosConfigIntrospection:
             gqa_cfg(n_kv_heads=3)
         with pytest.raises(ValueError, match="qk_rope_head_dim must be even"):
             mla_cfg(qk_rope_head_dim=7)
+        with pytest.raises(ValueError, match="n_experts_per_tok must be less than or equal"):
+            gqa_cfg(n_experts=2, n_experts_per_tok=3)
+        with pytest.raises(ValueError, match="dropout must be in the interval"):
+            gqa_cfg(dropout=1.1)
 
 
 class TestOpenMythosIntrospection:
