@@ -1,9 +1,14 @@
-try:
-    from transformers import AutoTokenizer
-except ImportError:  # pragma: no cover - dependency may be absent in lightweight envs
-    AutoTokenizer = None
-
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
+
+
+def _load_auto_tokenizer():
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - dependency may be absent
+        raise ModuleNotFoundError(
+            "transformers is required to construct MythosTokenizer"
+        ) from exc
+    return AutoTokenizer
 
 
 class MythosTokenizer:
@@ -30,11 +35,7 @@ class MythosTokenizer:
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
         """
-        if AutoTokenizer is None:
-            raise ModuleNotFoundError(
-                "transformers is required to construct MythosTokenizer"
-            )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer = _load_auto_tokenizer().from_pretrained(model_id)
 
     @property
     def vocab_size(self) -> int:
