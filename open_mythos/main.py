@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -94,6 +94,19 @@ class MythosConfig:
     speculative_n_loops: int = 2       # loop depth for draft model (fast, fewer iterations)
     speculative_temperature: float = 1.0
     speculative_top_k: int = 50
+
+    # ---- P0: Multi-Scale Loop + Curriculum Learning ----
+    enable_multiscale_loop: bool = False   # enable complexity-aware loop depth selection
+    loop_depths: list = field(default_factory=lambda: [4, 8, 16])  # easy, medium, hard
+    complexity_threshold_low: float = 0.33   # p < this → easy (loop_depths[0])
+    complexity_threshold_high: float = 0.66  # p < this → medium, else hard
+    enable_curriculum: bool = False         # enable curriculum learning for loop depth
+    curriculum_min_depth: int = 4          # starting loop depth for curriculum
+    curriculum_max_depth: int = 16         # maximum loop depth in curriculum
+    curriculum_phase1_steps: int = 2000   # 0-20%: fixed min_depth
+    curriculum_phase2_steps: int = 5000    # 20-50%: fixed medium_depth
+    curriculum_phase3_steps: int = 10000   # 50-80%: mixed [4,8,12,16]
+    curriculum_phase4_steps: int = 20000    # 80-100%: dynamic + ACT
 
     # ---- P3: Hierarchical Loop + Meta-Learning ----
     hierarchical_num_scales: int = 4   # number of hierarchical scales
@@ -1756,6 +1769,196 @@ class OpenMythos(nn.Module):
             top_k=top_k,
         )
         return decoder.generate(input_ids, max_new_tokens=max_new_tokens)
+
+
+# ===========================================================================
+# P0: Multi-Scale Loop + Curriculum Learning
+# ===========================================================================
+
+
+class DepthSelector(nn.Module):
+    """
+    P0: Complexity-aware loop depth selector.
+
+    Learns to predict the complexity of the input hidden state, then selects
+    an appropriate loop depth (from cfg.loop_depths) based on thresholds.
+
+    Architecture:
+    - Attention pooling over sequence → single vector
+    - Linear network → complexity score in [0, 1]
+    - Threshold comparison → depth selection
+
+    Usage:
+        depth_selector = DepthSelector(cfg)
+        complexity = depth_selector(h)           # (B,) complexity scores
+        loop_depth = depth_selector.select_depth(complexity)  # (B,) depths
+    """
+
+    def __init__(self, cfg: MythosConfig):
+        """
+        Args:
+            cfg -- MythosConfig; uses dim, loop_depths, complexity_threshold_*
+        """
+        super().__init__()
+        self.cfg = cfg
+        self.depths = cfg.loop_depths  # e.g., [4, 8, 16]
+
+        # Learned complexity predictor: hidden state → complexity score
+        # Uses attention pooling over sequence to get a single complexity score
+        self.complexity_net = nn.Sequential(
+            nn.Linear(cfg.dim, cfg.dim // 2),
+            nn.GELU(),
+            nn.Linear(cfg.dim // 2, 1),
+        )
+
+        # Attention pooling for sequence → single vector
+        self.pool_attn = nn.Linear(cfg.dim, 1)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Predict complexity score for the input hidden state.
+
+        Args:
+            h -- hidden state of shape (B, T, dim)
+
+        Returns:
+            Complexity score tensor of shape (B,), values in [0, 1]
+            Higher = more complex task
+        """
+        B, T, D = h.shape
+
+        # Attention pooling: weighted average of sequence positions
+        weights = F.softmax(self.pool_attn(h), dim=1)  # (B, T, 1)
+        h_pooled = (weights * h).sum(dim=1)  # (B, D)
+
+        # Predict complexity
+        complexity = torch.sigmoid(self.complexity_net(h_pooled).squeeze(-1))  # (B,)
+
+        return complexity
+
+    def select_depth(self, complexity: torch.Tensor) -> torch.Tensor:
+        """
+        Select loop depth based on complexity score.
+
+        Args:
+            complexity -- complexity score tensor of shape (B,), values in [0, 1]
+
+        Returns:
+            Loop depth tensor of shape (B,), values in self.depths
+        """
+        depths_tensor = torch.tensor(self.depths, device=complexity.device, dtype=torch.long)
+
+        # Create decision boundaries
+        thresholds = torch.tensor(
+            [self.cfg.complexity_threshold_low, self.cfg.complexity_threshold_high],
+            device=complexity.device,
+        )
+
+        # Determine index based on complexity
+        # complexity < low → 0, low ≤ complexity < high → 1, else → 2
+        indices = torch.zeros_like(complexity, dtype=torch.long)
+        indices = indices + (complexity >= thresholds[0]).long()
+        indices = indices + (complexity >= thresholds[1]).long()
+        indices = indices.clamp(0, len(self.depths) - 1)
+
+        return depths_tensor[indices]
+
+
+class CurriculumLoopScheduler:
+    """
+    P0: Curriculum learning scheduler for loop depth.
+
+    Implements 4-phase curriculum for loop depth training:
+
+    Phase 1 (0 - phase1_steps): Fixed min_depth
+        - All samples use curriculum_min_depth loops
+        - Model learns basic pattern matching
+
+    Phase 2 (phase1_steps - phase1+phase2_steps): Fixed medium_depth
+        - All samples use (min_depth + max_depth) // 2 loops
+        - Model learns intermediate reasoning
+
+    Phase 3 (phase1+phase2 - phase1+phase2+phase3_steps): Mixed depths
+        - Randomly sample from [min_depth, mid_depth, max_depth]
+        - Model learns to handle variable complexity
+
+    Phase 4 (remaining steps): Dynamic + ACT
+        - Use DepthSelector to predict depth
+        - Fall back to max_depth with ACT for remaining steps
+
+    This curriculum prevents early training instability while enabling
+    the model to eventually learn adaptive depth selection.
+    """
+
+    def __init__(self, cfg: MythosConfig, total_steps: int):
+        """
+        Args:
+            cfg -- MythosConfig with curriculum parameters
+            total_steps -- total training steps for calculating phase boundaries
+        """
+        self.cfg = cfg
+        self.total_steps = total_steps
+
+        self.phase1_end = cfg.curriculum_phase1_steps
+        self.phase2_end = self.phase1_end + cfg.curriculum_phase2_steps
+        self.phase3_end = self.phase2_end + cfg.curriculum_phase3_steps
+        # Phase 4: remaining steps (up to total_steps)
+
+        # Calculate depths
+        self.min_depth = cfg.curriculum_min_depth
+        self.max_depth = cfg.curriculum_max_depth
+        self.mid_depth = (self.min_depth + self.max_depth) // 2
+
+    def get_depth(self, step: int, complexity: Optional[torch.Tensor] = None) -> int:
+        """
+        Get the loop depth for a given training step.
+
+        Args:
+            step -- current training step
+            complexity -- optional complexity score for Phase 4 (shape: B,)
+
+        Returns:
+            Loop depth (int) for this step
+        """
+        if step < self.phase1_end:
+            # Phase 1: Fixed min_depth
+            return self.min_depth
+
+        elif step < self.phase2_end:
+            # Phase 2: Fixed mid_depth
+            return self.mid_depth
+
+        elif step < self.phase3_end:
+            # Phase 3: Random mixed depths
+            import random
+            return random.choice([self.min_depth, self.mid_depth, self.max_depth])
+
+        else:
+            # Phase 4: Dynamic + ACT
+            # If complexity predictor is provided, use it
+            if complexity is not None:
+                # Use median complexity as depth selector
+                median_complexity = complexity.median().item()
+                if median_complexity < self.cfg.complexity_threshold_low:
+                    return self.min_depth
+                elif median_complexity < self.cfg.complexity_threshold_high:
+                    return self.mid_depth
+                else:
+                    return self.max_depth
+            else:
+                # Fallback to max_depth with ACT
+                return self.max_depth
+
+    def get_phase(self, step: int) -> str:
+        """Return the current curriculum phase name."""
+        if step < self.phase1_end:
+            return "phase1_fixed_min"
+        elif step < self.phase2_end:
+            return "phase2_fixed_mid"
+        elif step < self.phase3_end:
+            return "phase3_mixed"
+        else:
+            return "phase4_dynamic_act"
 
 
 # ===========================================================================
