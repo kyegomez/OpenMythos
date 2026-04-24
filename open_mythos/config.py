@@ -117,6 +117,17 @@ class MythosConfig:
             raise ValueError("max_output_tokens must be positive")
         if self.dropout < 0:
             raise ValueError("dropout must be non-negative")
+        if self.dim % self.n_heads != 0:
+            raise ValueError("dim must be divisible by n_heads")
+        if (self.dim // self.n_heads) % 2 != 0:
+            raise ValueError("dim // n_heads must be even for RoPE")
+        if self.attn_type == "gqa":
+            if self.n_kv_heads > self.n_heads:
+                raise ValueError("n_kv_heads must be less than or equal to n_heads")
+            if self.n_heads % self.n_kv_heads != 0:
+                raise ValueError("n_heads must be divisible by n_kv_heads")
+        if self.attn_type == "mla" and self.qk_rope_head_dim % 2 != 0:
+            raise ValueError("qk_rope_head_dim must be even for MLA RoPE")
 
     def to_dict(self) -> dict[str, object]:
         """Return a plain-Python config dictionary for serialization."""

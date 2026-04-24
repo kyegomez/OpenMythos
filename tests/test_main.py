@@ -578,6 +578,12 @@ class TestMythosConfigIntrospection:
             gqa_cfg(dim=0)
         with pytest.raises(ValueError, match="act_threshold must be in the interval"):
             gqa_cfg(act_threshold=1.1)
+        with pytest.raises(ValueError, match="dim must be divisible by n_heads"):
+            gqa_cfg(dim=66, n_heads=8)
+        with pytest.raises(ValueError, match="n_heads must be divisible by n_kv_heads"):
+            gqa_cfg(n_kv_heads=3)
+        with pytest.raises(ValueError, match="qk_rope_head_dim must be even"):
+            mla_cfg(qk_rope_head_dim=7)
 
 
 class TestOpenMythosIntrospection:
