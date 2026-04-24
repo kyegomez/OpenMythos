@@ -1,5 +1,6 @@
 import torch
 import pytest
+import open_mythos
 from open_mythos.main import (
     ACTHalting,
     Expert,
@@ -596,6 +597,15 @@ class TestOpenMythosIntrospection:
         model = OpenMythos(cfg)
 
         assert model.describe() == cfg.runtime_profile()
+
+
+class TestPackageLazyExports:
+    def test_lazy_export_is_cached_on_module(self):
+        first = open_mythos.OpenMythos
+        second = open_mythos.OpenMythos
+
+        assert first is second
+        assert open_mythos.__dict__["OpenMythos"] is first
 
 # ---------------------------------------------------------------------------
 # OpenMythos — GQA mode

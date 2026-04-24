@@ -1,3 +1,5 @@
+from importlib import import_module
+
 from open_mythos.config import MythosConfig
 from open_mythos.tokenizer import MythosTokenizer, get_vocab_size, load_tokenizer
 from open_mythos.variants import (
@@ -26,6 +28,7 @@ _MAIN_EXPORTS = {
     "loop_index_embedding",
     "precompute_rope_freqs",
 }
+_MAIN_MODULE = None
 
 __all__ = [
     "MythosConfig",
@@ -58,37 +61,10 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in _MAIN_EXPORTS:
-        from open_mythos.main import (
-            ACTHalting,
-            Expert,
-            GQAttention,
-            LoRAAdapter,
-            LTIInjection,
-            MLAttention,
-            MoEFFN,
-            OpenMythos,
-            RecurrentBlock,
-            RMSNorm,
-            TransformerBlock,
-            apply_rope,
-            loop_index_embedding,
-            precompute_rope_freqs,
-        )
-
-        return {
-            "ACTHalting": ACTHalting,
-            "Expert": Expert,
-            "GQAttention": GQAttention,
-            "LoRAAdapter": LoRAAdapter,
-            "LTIInjection": LTIInjection,
-            "MLAttention": MLAttention,
-            "MoEFFN": MoEFFN,
-            "OpenMythos": OpenMythos,
-            "RecurrentBlock": RecurrentBlock,
-            "RMSNorm": RMSNorm,
-            "TransformerBlock": TransformerBlock,
-            "apply_rope": apply_rope,
-            "loop_index_embedding": loop_index_embedding,
-            "precompute_rope_freqs": precompute_rope_freqs,
-        }[name]
+        global _MAIN_MODULE
+        if _MAIN_MODULE is None:
+            _MAIN_MODULE = import_module("open_mythos.main")
+        value = getattr(_MAIN_MODULE, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module 'open_mythos' has no attribute {name!r}")
