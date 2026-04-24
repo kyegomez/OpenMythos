@@ -1,0 +1,192 @@
+# OpenMythos Enhanced Configuration
+# Schema-First Configuration with P0-P3 Enhancements and OpenMetadata Integration
+
+version: "1.0.0"
+name: "openmythos-enhanced-default"
+description: "Default OpenMythos configuration with all P0-P3 enhancements enabled"
+
+# =============================================================================
+# Core Model Configuration
+# =============================================================================
+model:
+  # Core architecture
+  vocab_size: 32000
+  dim: 2048                    # Hidden dimension
+  n_heads: 16                  # Number of query heads
+  n_kv_heads: 4                # Fewer KV heads for GQA efficiency
+  max_seq_len: 4096            # Maximum sequence length for RoPE
+  max_output_tokens: 4096       # Maximum generation tokens
+  dropout: 0.0                 # Dropout rate (0 = disabled)
+  
+  # Layer configuration
+  prelude_layers: 2            # Transformer layers before recurrent loop
+  coda_layers: 2               # Transformer layers after recurrent loop
+  
+  # RoPE configuration
+  rope_theta: 500000.0          # RoPE base frequency
+  
+  # LoRA configuration
+  lora_rank: 16                 # LoRA adapter rank
+
+# =============================================================================
+# Attention Configuration
+# =============================================================================
+attention:
+  attn_type: "mla"             # "mla" for Multi-Latent Attention (recommended)
+  
+  # MLA parameters (used when attn_type="mla")
+  kv_lora_rank: 512             # Compressed KV latent dimension
+  q_lora_rank: 1536             # Compressed Q latent dimension
+  qk_rope_head_dim: 64          # Per-head dims with RoPE
+  qk_nope_head_dim: 128         # Per-head dims without RoPE
+  v_head_dim: 128              # Per-head value dimension
+
+# =============================================================================
+# Recurrent Loop Configuration
+# =============================================================================
+loop:
+  # Depth bounds
+  min_depth: 4                 # Minimum loop iterations
+  max_depth: 16                # Maximum loop iterations
+  max_loop_iters: 16           # Default inference depth
+  
+  # Curriculum learning
+  curriculum_enabled: true
+  curriculum_phases:
+    - name: "warmup"
+      duration_steps: 2000
+      depth: 4
+    - name: "transition"
+      duration_steps: 5000
+      depth: 10
+    - name: "mixed"
+      duration_steps: 10000
+      depth_range: [4, 16]
+    - name: "adaptive"
+      duration_steps: -1
+      mode: "complexity_aware"
+  
+  # ACT (Adaptive Computation Time)
+  act_enabled: true
+  act_threshold: 0.99
+  act_halting_type: "exponential"
+  
+  # Complexity thresholds for depth selection
+  complexity_thresholds: [0.33, 0.66]
+
+# =============================================================================
+# Mixture of Experts Configuration
+# =============================================================================
+moe:
+  # Expert counts
+  n_experts: 64                # Total number of experts
+  n_shared_experts: 2          # Always-active shared experts
+  n_experts_per_tok: 4         # Top-K routing
+  expert_dim: 512               # Hidden dim per expert
+  
+  # Routing
+  capacity_factor: 1.25
+  expert_specialization: true
+  capacity_aware_routing: true
+  
+  # Expert groups (for specialization)
+  expert_groups:
+    - id: 0
+      name: "syntax"
+      experts: "0-15"
+      domain: "syntax_morphology"
+    - id: 1
+      name: "knowledge"
+      experts: "16-31"
+      domain: "factual_named_entities"
+    - id: 2
+      name: "reasoning"
+      experts: "32-47"
+      domain: "logic_deduction"
+    - id: 3
+      name: "math_code"
+      experts: "48-63"
+      domain: "math_code_formal"
+
+# =============================================================================
+# Data Contract Configuration (Inference SLA)
+# =============================================================================
+data_contract:
+  enabled: false
+  contract_path: "./contracts/inference_contract.yaml"
+  
+  # SLA constraints
+  max_latency_ms: 100.0
+  max_memory_mb: 4096
+  min_throughput_tokens_per_sec: 50.0
+  
+  # Quality standards
+  min_accuracy: 0.85
+  max_confidence_variance: 0.1
+  min_attention_coverage: 0.7
+  
+  # Monitoring
+  alert_on_latency_p95: true
+  alert_on_quality_drop: true
+  log_level: "INFO"
+
+# =============================================================================
+# OpenMetadata Integration
+# =============================================================================
+openmetadata:
+  enabled: false
+  endpoint: "http://localhost:8585"
+  jwt_token: null
+  
+  # Feature flags
+  enable_metadata_driven_depth: false    # Use OM complexity for loop depth
+  enable_inference_lineage: false         # Track inference lineage in OM
+  enable_quality_aware_routing: false    # Use data quality for MoE routing
+  enable_mcp_server: false              # Enable MCP server for AI assistants
+  enable_data_contract: false           # Enable inference data contracts
+  
+  # Cache
+  metadata_cache_ttl_seconds: 300
+  
+  # MCP server
+  mcp_port: 8080
+
+# =============================================================================
+# P0 Enhancements: Multi-scale loop depth + Curriculum learning
+# =============================================================================
+enhancements:
+  p0:
+    enabled: true
+    multiscale_loop_enabled: true       # Dynamic loop depth selection
+    curriculum_enabled: true             # 4-phase curriculum scheduler
+  
+  # ---------------------------------------------------------------------------
+  # P1 Enhancements: Flash MLA + Consistency + Capacity Routing
+  # ---------------------------------------------------------------------------
+  p1:
+    enabled: true
+    flash_mla_enabled: true            # Tile-based MLA computation
+    consistency_regularization_enabled: true  # Loop consistency loss
+    capacity_aware_routing_enabled: true    # Expert capacity balancing
+  
+  # ---------------------------------------------------------------------------
+  # P2 Enhancements: Cross-layer KV + Speculative Decoding + Expert Specialization
+  # ---------------------------------------------------------------------------
+  p2:
+    enabled: true
+    cross_layer_kv_enabled: true
+    cross_layer_kv_share_every: 3       # Share KV every N layers
+    speculative_decoding_enabled: true
+    speculative_k_tokens: 4             # Speculate K tokens ahead
+    expert_specialization_enabled: true # Task-conditioned routing
+  
+  # ---------------------------------------------------------------------------
+  # P3 Enhancements: Hierarchical Loops + Meta-learned Depth
+  # ---------------------------------------------------------------------------
+  p3:
+    enabled: true
+    hierarchical_loops_enabled: true
+    n_outer_loops: 4
+    n_inner_loops: 4
+    meta_learned_depth_enabled: true
+    lstm_hidden: 512
