@@ -2447,8 +2447,3 @@ class SpeculativeRDTDecoder:
             # but we don't add it since we already have enough
 
         return generated[:, :input_ids.shape[1] + max_new_tokens]
-
-
-# ===========================================================================
-# OpenMythos — Top-level Model
-# ===========================================================================
