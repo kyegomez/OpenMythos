@@ -271,13 +271,18 @@ class GQAttention(nn.Module):
             v = v.transpose(1, 2)
             if self.use_sdpa:
                 dropout_p = self.dropout_p if self.training else 0.0
+                # Pass mask through verbatim. mask is None means no
+                # masking (matching the manual path); when callers want
+                # causal attention they supply an explicit additive mask
+                # via OpenMythos._causal_mask. is_causal=True would diverge
+                # from the manual path's mask=None semantics.
                 out = F.scaled_dot_product_attention(
                     q,
                     k,
                     v,
                     attn_mask=mask,
                     dropout_p=dropout_p,
-                    is_causal=(mask is None and q.size(-2) > 1),
+                    is_causal=False,
                 )
             else:
                 scale = self.head_dim**-0.5
@@ -428,13 +433,18 @@ class MLAttention(nn.Module):
 
         if self.use_sdpa:
             dropout_p = self.attn_drop.p if self.training else 0.0
+            # Pass mask through verbatim. mask is None means no masking
+            # (matching the manual path); callers supply an explicit
+            # additive causal mask via OpenMythos._causal_mask when
+            # causal attention is desired. is_causal=True would diverge
+            # from the manual path's mask=None semantics.
             out = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 attn_mask=mask,
                 dropout_p=dropout_p,
-                is_causal=(mask is None and q.size(-2) > 1),
+                is_causal=False,
             )
         else:
             scale = self.q_head_dim**-0.5

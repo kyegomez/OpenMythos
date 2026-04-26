@@ -309,6 +309,31 @@ class TestGQAttention:
             o_sdpa = attn_sdpa(x, freqs[:seq_len], mask)
         assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
 
+    def test_sdpa_no_mask_is_bidirectional(self):
+        # When mask=None, SDPA must match the manual path (no masking),
+        # not silently switch to causal. Regression for qodo finding on
+        # GQAttention.forward.
+        torch.manual_seed(0)
+        cfg = gqa_cfg()
+        cfg.use_sdpa = False
+        attn_manual = GQAttention(cfg)
+        attn_manual.eval()
+        cfg.use_sdpa = True
+        attn_sdpa = GQAttention(cfg)
+        attn_sdpa.eval()
+        attn_sdpa.load_state_dict(attn_manual.state_dict())
+
+        seq_len = 16
+        x = torch.randn(2, seq_len, cfg.dim)
+        freqs = precompute_rope_freqs(
+            cfg.dim // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta
+        )
+
+        with torch.no_grad():
+            o_manual = attn_manual(x, freqs[:seq_len], mask=None)
+            o_sdpa = attn_sdpa(x, freqs[:seq_len], mask=None)
+        assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # MLAttention
@@ -372,6 +397,31 @@ class TestMLAttention:
         with torch.no_grad():
             o_manual = attn_manual(x, freqs[:seq_len], mask)
             o_sdpa = attn_sdpa(x, freqs[:seq_len], mask)
+        assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
+
+    def test_sdpa_no_mask_is_bidirectional(self):
+        # When mask=None, SDPA must match the manual path (no masking),
+        # not silently switch to causal. Regression for qodo finding on
+        # MLAttention.forward.
+        torch.manual_seed(0)
+        cfg = mla_cfg()
+        cfg.use_sdpa = False
+        attn_manual = MLAttention(cfg)
+        attn_manual.eval()
+        cfg.use_sdpa = True
+        attn_sdpa = MLAttention(cfg)
+        attn_sdpa.eval()
+        attn_sdpa.load_state_dict(attn_manual.state_dict())
+
+        seq_len = 16
+        x = torch.randn(2, seq_len, cfg.dim)
+        freqs = precompute_rope_freqs(
+            cfg.qk_rope_head_dim, cfg.max_seq_len, cfg.rope_theta
+        )
+
+        with torch.no_grad():
+            o_manual = attn_manual(x, freqs[:seq_len], mask=None)
+            o_sdpa = attn_sdpa(x, freqs[:seq_len], mask=None)
         assert torch.allclose(o_manual, o_sdpa, atol=1e-5)
 
 
