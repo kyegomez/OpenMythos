@@ -1,6 +1,14 @@
-from transformers import AutoTokenizer
-
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
+
+
+def _load_auto_tokenizer():
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:  # pragma: no cover - dependency may be absent
+        raise ModuleNotFoundError(
+            "transformers is required to construct MythosTokenizer"
+        ) from exc
+    return AutoTokenizer
 
 
 class MythosTokenizer:
@@ -27,7 +35,7 @@ class MythosTokenizer:
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+        self.tokenizer = _load_auto_tokenizer().from_pretrained(model_id)
 
     @property
     def vocab_size(self) -> int:
@@ -62,3 +70,13 @@ class MythosTokenizer:
             str: Decoded string representation of the token IDs.
         """
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+
+def load_tokenizer(model_id: str = DEFAULT_MODEL_ID) -> MythosTokenizer:
+    """Construct a tokenizer wrapper using the default or requested model id."""
+    return MythosTokenizer(model_id=model_id)
+
+
+def get_vocab_size(model_id: str = DEFAULT_MODEL_ID) -> int:
+    """Return the tokenizer vocabulary size for a given model id."""
+    return load_tokenizer(model_id=model_id).vocab_size

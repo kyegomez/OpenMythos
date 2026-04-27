@@ -1,5 +1,6 @@
 import torch
 import pytest
+import open_mythos
 from open_mythos.main import (
     ACTHalting,
     Expert,
@@ -542,6 +543,69 @@ class TestRecurrentBlock:
         out = self.block(h, e, self.freqs, n_loops=1)
         assert out.shape == (B, T, self.cfg.dim)
 
+
+# ---------------------------------------------------------------------------
+# MythosConfig / OpenMythos introspection
+# ---------------------------------------------------------------------------
+
+
+class TestMythosConfigIntrospection:
+    def test_runtime_profile_includes_cache_layout(self):
+        cfg = mla_cfg(prelude_layers=2, coda_layers=1, max_loop_iters=4)
+        profile = cfg.runtime_profile()
+
+        assert profile["model_name"] == "OpenMythos"
+        assert profile["attn_type"] == "mla"
+        assert profile["supports_kv_cache"] is True
+        assert profile["supports_incremental_decode"] is True
+        assert profile["cache_layout"]["prelude"] == ["prelude_0", "prelude_1"]
+        assert profile["cache_layout"]["recurrent"] == "recurrent_loop_{t}"
+        assert profile["cache_layout"]["coda"] == ["coda_0"]
+
+    def test_to_dict_round_trips_dataclass_fields(self):
+        cfg = gqa_cfg(dim=128, max_output_tokens=256)
+        data = cfg.to_dict()
+
+        assert data["dim"] == 128
+        assert data["max_output_tokens"] == 256
+        assert data["attn_type"] == "gqa"
+
+    def test_invalid_attn_type_raises(self):
+        with pytest.raises(ValueError, match="Unsupported attn_type"):
+            gqa_cfg(attn_type="mlaa")
+
+    def test_invalid_numeric_fields_raise(self):
+        with pytest.raises(ValueError, match="dim must be positive"):
+            gqa_cfg(dim=0)
+        with pytest.raises(ValueError, match="act_threshold must be in the interval"):
+            gqa_cfg(act_threshold=1.1)
+        with pytest.raises(ValueError, match="dim must be divisible by n_heads"):
+            gqa_cfg(dim=66, n_heads=8)
+        with pytest.raises(ValueError, match="n_heads must be divisible by n_kv_heads"):
+            gqa_cfg(n_kv_heads=3)
+        with pytest.raises(ValueError, match="qk_rope_head_dim must be even"):
+            mla_cfg(qk_rope_head_dim=7)
+        with pytest.raises(ValueError, match="n_experts_per_tok must be less than or equal"):
+            gqa_cfg(n_experts=2, n_experts_per_tok=3)
+        with pytest.raises(ValueError, match="dropout must be in the interval"):
+            gqa_cfg(dropout=1.1)
+
+
+class TestOpenMythosIntrospection:
+    def test_describe_matches_config_profile(self):
+        cfg = gqa_cfg()
+        model = OpenMythos(cfg)
+
+        assert model.describe() == cfg.runtime_profile()
+
+
+class TestPackageLazyExports:
+    def test_lazy_export_is_cached_on_module(self):
+        first = open_mythos.OpenMythos
+        second = open_mythos.OpenMythos
+
+        assert first is second
+        assert open_mythos.__dict__["OpenMythos"] is first
 
 # ---------------------------------------------------------------------------
 # OpenMythos — GQA mode
