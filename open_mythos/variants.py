@@ -4,6 +4,10 @@ from open_mythos.main import MythosConfig
 #   total ≈ embed + prelude/coda dense blocks + recurrent MLA + MoE
 #   MoE   = 3 * dim * expert_dim * (n_experts + n_shared * n_experts_per_tok)
 # expert_dim is solved from the residual budget after all other terms.
+#
+# MiniMax-M2.7 reference config (see minimax_m2_config below):
+#   Architecture source: MiniMax-01 technical report (MiniMaxAI/MiniMax-M2.7 on HuggingFace)
+#   230B total params, ~7B active per token, 48Q/8KV heads, head_dim=128, 32 routed experts
 
 
 def mythos_1b() -> MythosConfig:
@@ -195,4 +199,62 @@ def mythos_1t() -> MythosConfig:
         rope_theta=2000000.0,
         lora_rank=256,
         max_output_tokens=131072,
+    )
+
+
+def minimax_m2_config() -> MythosConfig:
+    """OpenMythos configuration matching the MiniMax-M2.7 architecture.
+
+    MiniMax-M2.7 (MiniMaxAI/MiniMax-M2.7 on HuggingFace) is a 230B-parameter sparse
+    MoE language model.  Key structural dimensions expressed in OpenMythos terms:
+
+    * ``dim = 6144``  — matches MiniMax-M2.7's hidden size
+    * ``n_heads = 48`` / ``n_kv_heads = 8``  — 6× GQA ratio (48 query heads, 8 KV heads)
+    * ``qk_rope_head_dim = 64``, ``qk_nope_head_dim = 64``, ``v_head_dim = 128``
+      — the per-head dimensions satisfy MiniMax-M2.7's head_dim = 128 for both
+      the Q/K attention key size (rope + nope = 128) and the value projection (128)
+    * ``n_experts = 32``, ``n_shared_experts = 2``, ``n_experts_per_tok = 4``
+      — mirrors MiniMax-M2.7's fine-grained MoE design (32 routed + 2 always-on)
+    * ``max_seq_len = 40960``  — MiniMax-M2.7's 40K-token native context window
+    * ``rope_theta = 10_000_000``  — high RoPE base for long-context stability
+
+    Use this config to instantiate an OpenMythos model whose structural dimensions
+    reflect the MiniMax-M2.7 design point.  Weights are randomly initialized; load
+    ``MiniMaxAI/MiniMax-M2.7`` from HuggingFace for production inference.
+
+    Example::
+
+        from open_mythos.variants import minimax_m2_config
+        from open_mythos.main import OpenMythos
+        import torch
+
+        cfg = minimax_m2_config()
+        model = OpenMythos(cfg)
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        logits = model(ids, n_loops=4)
+        print(logits.shape)  # (1, 16, 200064)
+    """
+    return MythosConfig(
+        vocab_size=200064,
+        dim=6144,
+        n_heads=48,
+        n_kv_heads=8,
+        max_seq_len=40960,
+        max_loop_iters=16,
+        prelude_layers=4,
+        coda_layers=4,
+        attn_type="mla",
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_rope_head_dim=64,
+        qk_nope_head_dim=64,
+        v_head_dim=128,
+        n_experts=32,
+        n_shared_experts=2,
+        n_experts_per_tok=4,
+        expert_dim=8192,
+        act_threshold=0.99,
+        rope_theta=10_000_000.0,
+        lora_rank=32,
+        max_output_tokens=4096,
     )

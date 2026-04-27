@@ -15,8 +15,9 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
-from open_mythos.tokenizer import MythosTokenizer
+from open_mythos.tokenizer import MINIMAX_M2_MODEL_ID, MythosTokenizer
 from open_mythos.variants import (
+    minimax_m2_config,
     mythos_1b,
     mythos_1t,
     mythos_3b,
@@ -49,6 +50,8 @@ __all__ = [
     "mythos_100b",
     "mythos_500b",
     "mythos_1t",
+    "minimax_m2_config",
+    "MINIMAX_M2_MODEL_ID",
     "load_tokenizer",
     "get_vocab_size",
     "MythosTokenizer",
