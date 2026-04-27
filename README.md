@@ -99,7 +99,7 @@ print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
 A = model.recurrent.injection.get_A()
 rho = torch.linalg.eigvals(A).abs().max().item()
 print(
-    f"[{attn_type.upper()}] Spectral radius ρ(A) = {rho:.4f} (must be < 1)"
+    f"[{attn_type.upper()}] Spectral radius ρ(A): {rho:.4f} (must be < 1)"
 )
 ```
 
