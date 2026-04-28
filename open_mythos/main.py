@@ -112,8 +112,9 @@ class RMSNorm(nn.Module):
         Returns:
             RMS-normalized tensor of the same shape, rescaled by self.weight
         """
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return x * rms * self.weight
+        dtype = x.dtype
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return (x * rms * self.weight).to(dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,7 @@ class GQAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        x = x.to(self.wq.weight.dtype)  # align with FSDP param dtype
         q = self.wq(x).view(B, T, self.n_heads, self.head_dim)
         k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim)
         v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim)
@@ -268,7 +270,9 @@ class GQAttention(nn.Module):
             if mask is not None:
                 attn = attn + mask
             attn = F.dropout(
-                F.softmax(attn, dim=-1), p=self.dropout_p, training=self.training
+                F.softmax(attn, dim=-1).to(v.dtype),
+                p=self.dropout_p,
+                training=self.training,
             )
             out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -367,6 +371,7 @@ class MLAttention(nn.Module):
             Output tensor of shape (B, T, dim)
         """
         B, T, _ = x.shape
+        x = x.to(self.q_down.weight.dtype)  # align with FSDP param dtype
 
         # Q
         c_q = self.q_norm(self.q_down(x))
@@ -412,7 +417,7 @@ class MLAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         if mask is not None:
             attn = attn + mask
-        attn = self.attn_drop(F.softmax(attn, dim=-1))
+        attn = self.attn_drop(F.softmax(attn, dim=-1).to(v.dtype))
         out = torch.matmul(attn, v)  # (B, H, T, v_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.wo(out)
@@ -450,6 +455,7 @@ class Expert(nn.Module):
         Returns:
             Tensor of shape (..., dim)
         """
+        x = x.to(self.gate.weight.dtype)  # align with FSDP param dtype
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
@@ -503,6 +509,7 @@ class MoEFFN(nn.Module):
             of the weighted routed expert outputs
         """
         B, T, D = x.shape
+        x = x.to(self.router.weight.dtype)  # align with FSDP param dtype
         flat = x.view(B * T, D)
 
         # Aux-loss-free load balancing (DeepSeek-V3): the bias shifts only the
@@ -513,18 +520,40 @@ class MoEFFN(nn.Module):
         scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp(
+            min=1e-9
+        )
 
-        # routed expert dispatch (token-level scatter)
-        out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        # Grouped expert dispatch — one expert call per active expert.
+        # Flatten all topk (token, expert) pairs, sort by expert ID,
+        # run each expert once on its contiguous batch, scatter back.
+        N = flat.size(0)
+        flat_expert_ids = topk_idx.view(-1)  # (N*topk,)
+        flat_scores = topk_scores.view(-1, 1)  # (N*topk, 1)
+        flat_tokens = flat.repeat_interleave(self.topk, dim=0)  # (N*topk, D)
+
+        sorted_order = flat_expert_ids.argsort(stable=True)
+        sorted_expert_ids = flat_expert_ids[sorted_order]
+        sorted_tokens = flat_tokens[sorted_order]
+        sorted_scores = flat_scores[sorted_order]
+
+        unique_experts, counts = torch.unique_consecutive(
+            sorted_expert_ids, return_counts=True
+        )
+        split_tokens = sorted_tokens.split(counts.tolist())
+        split_scores = sorted_scores.split(counts.tolist())
+
+        expert_outputs = []
+        for eid, tok_batch, sc_batch in zip(
+            unique_experts.tolist(), split_tokens, split_scores
+        ):
+            expert_outputs.append(sc_batch * self.routed_experts[eid](tok_batch))
+
+        sorted_out = torch.cat(expert_outputs, dim=0)
+        # Unsort back to original (N*topk,) order, then sum over topk dim
+        out_flat = torch.zeros_like(sorted_out)
+        out_flat[sorted_order] = sorted_out
+        out = out_flat.view(N, self.topk, D).sum(dim=1)  # (N, D)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
@@ -561,12 +590,16 @@ def loop_index_embedding(
     """
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        ** (
+            torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32)
+            / loop_dim
+        )
     )
     angles = loop_t * freqs  # (loop_dim//2,)
     emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
-    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
+    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=torch.float32)
     emb_full[:loop_dim] = emb
+    emb_full = emb_full.to(h.dtype)
     return h + emb_full.unsqueeze(0).unsqueeze(0)
 
 
@@ -615,8 +648,9 @@ class LoRAAdapter(nn.Module):
         max_t = self.scale.num_embeddings - 1
         t_idx = loop_t if loop_t <= max_t else max_t
         s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
+        x = x.to(self.down.weight.dtype)  # align with FSDP param dtype
         down = self.down(x) * s  # (B, T, rank)
-        return down @ self.B  # (B, T, dim)
+        return down @ self.B.to(down.dtype)  # (B, T, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +811,7 @@ class ACTHalting(nn.Module):
         Returns:
             Halting probability tensor of shape (B, T), values in (0, 1)
         """
-        return torch.sigmoid(self.halt(h)).squeeze(-1)
+        return torch.sigmoid(self.halt(h.to(self.halt.weight.dtype))).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -830,22 +864,28 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        bypass_act: bool = False,
     ) -> torch.Tensor:
         """
-        Run the recurrent loop for up to n_loops iterations with ACT early exit.
+        Run the recurrent loop for up to n_loops iterations.
 
         Args:
-            h        -- initial hidden state from the Prelude, shape (B, T, dim)
-            e        -- encoded input frozen for injection each step, shape (B, T, dim)
-            freqs_cis-- precomputed RoPE frequencies
-            mask     -- additive causal mask or None
-            n_loops  -- number of loop iterations; defaults to cfg.max_loop_iters.
-                        Can be increased at inference for deeper reasoning (depth extrapolation).
-            kv_cache -- cache dict passed through to the inner TransformerBlock;
-                        each loop iteration uses a separate cache key
+            h          -- initial hidden state from the Prelude, shape (B, T, dim)
+            e          -- encoded input frozen for injection each step, shape (B, T, dim)
+            freqs_cis  -- precomputed RoPE frequencies
+            mask       -- additive causal mask or None
+            n_loops    -- number of loop iterations; defaults to cfg.max_loop_iters.
+                          Can be increased at inference for deeper reasoning (depth extrapolation).
+            kv_cache   -- cache dict passed through to the inner TransformerBlock;
+                          each loop iteration uses a separate cache key
+            bypass_act -- if True, skip ACT weighting and return the final h directly
+                          after running all n_loops iterations (used for Option B
+                          stochastic-depth training).
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            ACT-weighted sum of hidden states across iterations when bypass_act=False,
+            or the final hidden state after n_loops iterations when bypass_act=True.
+            Shape: (B, T, dim) in both cases.
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -861,6 +901,9 @@ class RecurrentBlock(nn.Module):
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
+
+            if bypass_act:
+                continue
 
             p = self.act(h)  # (B, T)
             still_running = ~halted
@@ -885,9 +928,35 @@ class RecurrentBlock(nn.Module):
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
-                break
+            if kv_cache is None:
+                all_halted = halted.all()
+                # Under FSDP/DDP each rank has different data, so halted.all()
+                # can differ across ranks.  If one rank breaks out of the loop
+                # while others continue, the FSDP all-gather inside self.block
+                # deadlocks (the exited rank never issues the collective).
+                # All-reduce with MIN so ranks only exit together.
+                # The all-reduce is unconditional — every rank must participate
+                # regardless of its local halting state.
+                if torch.distributed.is_initialized():
+                    flag = torch.tensor(
+                        [all_halted], dtype=torch.int32, device=h.device
+                    )
+                    torch.distributed.all_reduce(
+                        flag, op=torch.distributed.ReduceOp.MIN
+                    )
+                    all_halted = flag.item() > 0
+                if all_halted:
+                    break
 
+        if bypass_act:
+            return h
+
+        # Assign remainder weight for positions that never halted within n_loops.
+        # Without this, non-halted positions have weights summing to < 1.0.
+        not_halted = ~halted
+        if not_halted.any():
+            final_remainder = (1.0 - cumulative_p).clamp(min=0) * not_halted.float()
+            h_out = h_out + final_remainder.unsqueeze(-1) * h
         return h_out
 
 
@@ -995,20 +1064,24 @@ class OpenMythos(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        bypass_act: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
 
         Args:
-            input_ids -- token indices of shape (B, T)
-            n_loops   -- recurrent loop depth; defaults to cfg.max_loop_iters.
-                         Increase at inference to extrapolate to harder problems.
-            kv_cache  -- dict mutated in-place for autoregressive KV caching;
-                         pass an empty dict {} and reuse across decode steps
-            start_pos -- index of the first token in input_ids within the full
-                         sequence; used to select the correct RoPE frequencies
-                         during incremental decoding (0 for prefill, prompt_len
-                         for each subsequent decode step)
+            input_ids  -- token indices of shape (B, T)
+            n_loops    -- recurrent loop depth; defaults to cfg.max_loop_iters.
+                          Increase at inference to extrapolate to harder problems.
+            kv_cache   -- dict mutated in-place for autoregressive KV caching;
+                          pass an empty dict {} and reuse across decode steps
+            start_pos  -- index of the first token in input_ids within the full
+                          sequence; used to select the correct RoPE frequencies
+                          during incremental decoding (0 for prefill, prompt_len
+                          for each subsequent decode step)
+            bypass_act -- if True, RecurrentBlock skips ACT weighting and returns
+                          the final hidden state directly. Default False preserves
+                          the existing ACT behavior.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -1026,12 +1099,13 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache, bypass_act)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
 
-        return self.head(self.norm(x))
+        x = self.norm(x)
+        return self.head(x.to(self.head.weight.dtype))
 
     @torch.no_grad()
     def generate(
