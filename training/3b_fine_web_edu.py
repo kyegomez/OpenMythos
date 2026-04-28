@@ -34,7 +34,6 @@ from open_mythos.main import TransformerBlock, RecurrentBlock
 from open_mythos.variants import mythos_3b
 from open_mythos.tokenizer import MythosTokenizer
 
-
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Poetry
+        run: |
+          pip install "poetry-core>=1.0.0" poetry
+          poetry config virtualenvs.in-project true
+
+      - name: Cache Poetry virtualenv
+        uses: actions/cache@v5
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.10-${{ hashFiles('pyproject.toml') }}
+
+      - name: Install dependencies
+        run: |
+          poetry install --with lint,test
+
+      - name: Check formatting (black)
+        run: |
+          poetry run black --check .
+
+      - name: Lint (ruff)
+        run: |
+          poetry run ruff check .
+
+      # Tests require upstream test fixes (freqs_cis slicing, LTI bound).
+      # Enable once PR #42 is merged.
+      # - name: Run tests (pytest)
+      #   run: |
+      #     poetry run pytest -q --tb=short
