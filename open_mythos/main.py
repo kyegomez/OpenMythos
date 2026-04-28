@@ -270,7 +270,9 @@ class GQAttention(nn.Module):
             if mask is not None:
                 attn = attn + mask
             attn = F.dropout(
-                F.softmax(attn, dim=-1).to(v.dtype), p=self.dropout_p, training=self.training
+                F.softmax(attn, dim=-1).to(v.dtype),
+                p=self.dropout_p,
+                training=self.training,
             )
             out = torch.matmul(attn, v)
             out = out.transpose(1, 2).contiguous().view(B, T, -1)
@@ -518,7 +520,9 @@ class MoEFFN(nn.Module):
         scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp(
+            min=1e-9
+        )
 
         # Grouped expert dispatch — one expert call per active expert.
         # Flatten all topk (token, expert) pairs, sort by expert ID,
@@ -586,7 +590,10 @@ def loop_index_embedding(
     """
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32) / loop_dim)
+        ** (
+            torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32)
+            / loop_dim
+        )
     )
     angles = loop_t * freqs  # (loop_dim//2,)
     emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
@@ -857,22 +864,28 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
+        bypass_act: bool = False,
     ) -> torch.Tensor:
         """
-        Run the recurrent loop for up to n_loops iterations with ACT early exit.
+        Run the recurrent loop for up to n_loops iterations.
 
         Args:
-            h        -- initial hidden state from the Prelude, shape (B, T, dim)
-            e        -- encoded input frozen for injection each step, shape (B, T, dim)
-            freqs_cis-- precomputed RoPE frequencies
-            mask     -- additive causal mask or None
-            n_loops  -- number of loop iterations; defaults to cfg.max_loop_iters.
-                        Can be increased at inference for deeper reasoning (depth extrapolation).
-            kv_cache -- cache dict passed through to the inner TransformerBlock;
-                        each loop iteration uses a separate cache key
+            h          -- initial hidden state from the Prelude, shape (B, T, dim)
+            e          -- encoded input frozen for injection each step, shape (B, T, dim)
+            freqs_cis  -- precomputed RoPE frequencies
+            mask       -- additive causal mask or None
+            n_loops    -- number of loop iterations; defaults to cfg.max_loop_iters.
+                          Can be increased at inference for deeper reasoning (depth extrapolation).
+            kv_cache   -- cache dict passed through to the inner TransformerBlock;
+                          each loop iteration uses a separate cache key
+            bypass_act -- if True, skip ACT weighting and return the final h directly
+                          after running all n_loops iterations (used for Option B
+                          stochastic-depth training).
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            ACT-weighted sum of hidden states across iterations when bypass_act=False,
+            or the final hidden state after n_loops iterations when bypass_act=True.
+            Shape: (B, T, dim) in both cases.
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -888,6 +901,9 @@ class RecurrentBlock(nn.Module):
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
+
+            if bypass_act:
+                continue
 
             p = self.act(h)  # (B, T)
             still_running = ~halted
@@ -932,13 +948,15 @@ class RecurrentBlock(nn.Module):
                 if all_halted:
                     break
 
+        if bypass_act:
+            return h
+
         # Assign remainder weight for positions that never halted within n_loops.
         # Without this, non-halted positions have weights summing to < 1.0.
         not_halted = ~halted
         if not_halted.any():
             final_remainder = (1.0 - cumulative_p).clamp(min=0) * not_halted.float()
             h_out = h_out + final_remainder.unsqueeze(-1) * h
-
         return h_out
 
 
@@ -1046,20 +1064,24 @@ class OpenMythos(nn.Module):
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
         start_pos: int = 0,
+        bypass_act: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass through Prelude → Recurrent Block → Coda.
 
         Args:
-            input_ids -- token indices of shape (B, T)
-            n_loops   -- recurrent loop depth; defaults to cfg.max_loop_iters.
-                         Increase at inference to extrapolate to harder problems.
-            kv_cache  -- dict mutated in-place for autoregressive KV caching;
-                         pass an empty dict {} and reuse across decode steps
-            start_pos -- index of the first token in input_ids within the full
-                         sequence; used to select the correct RoPE frequencies
-                         during incremental decoding (0 for prefill, prompt_len
-                         for each subsequent decode step)
+            input_ids  -- token indices of shape (B, T)
+            n_loops    -- recurrent loop depth; defaults to cfg.max_loop_iters.
+                          Increase at inference to extrapolate to harder problems.
+            kv_cache   -- dict mutated in-place for autoregressive KV caching;
+                          pass an empty dict {} and reuse across decode steps
+            start_pos  -- index of the first token in input_ids within the full
+                          sequence; used to select the correct RoPE frequencies
+                          during incremental decoding (0 for prefill, prompt_len
+                          for each subsequent decode step)
+            bypass_act -- if True, RecurrentBlock skips ACT weighting and returns
+                          the final hidden state directly. Default False preserves
+                          the existing ACT behavior.
 
         Returns:
             Logits of shape (B, T, vocab_size)
@@ -1077,7 +1099,7 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache, bypass_act)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
