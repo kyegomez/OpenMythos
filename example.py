@@ -38,8 +38,7 @@ total = sum(p.numel() for p in model.parameters())
 print(f"\n[{attn_type.upper()}] Parameters: {total:,}")
 
 ids = torch.randint(0, cfg.vocab_size, (2, 16))
-logits = model(ids, n_loops=4)
-print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
+logits, _ = model(ids, n_loops=4)
 
 out = model.generate(ids, max_new_tokens=8, n_loops=8)
 print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
