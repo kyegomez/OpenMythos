@@ -518,18 +518,38 @@ class MoEFFN(nn.Module):
         scores = F.softmax(logits, dim=-1)
         _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
         topk_scores = scores.gather(-1, topk_idx)
-        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
+        topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp(min=1e-9)
 
-        # routed expert dispatch (token-level scatter)
-        out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        # Grouped expert dispatch — one expert call per active expert.
+        # Flatten all topk (token, expert) pairs, sort by expert ID,
+        # run each expert once on its contiguous batch, scatter back.
+        N = flat.size(0)
+        flat_expert_ids = topk_idx.view(-1)  # (N*topk,)
+        flat_scores = topk_scores.view(-1, 1)  # (N*topk, 1)
+        flat_tokens = flat.repeat_interleave(self.topk, dim=0)  # (N*topk, D)
+
+        sorted_order = flat_expert_ids.argsort(stable=True)
+        sorted_expert_ids = flat_expert_ids[sorted_order]
+        sorted_tokens = flat_tokens[sorted_order]
+        sorted_scores = flat_scores[sorted_order]
+
+        unique_experts, counts = torch.unique_consecutive(
+            sorted_expert_ids, return_counts=True
+        )
+        split_tokens = sorted_tokens.split(counts.tolist())
+        split_scores = sorted_scores.split(counts.tolist())
+
+        expert_outputs = []
+        for eid, tok_batch, sc_batch in zip(
+            unique_experts.tolist(), split_tokens, split_scores
+        ):
+            expert_outputs.append(sc_batch * self.routed_experts[eid](tok_batch))
+
+        sorted_out = torch.cat(expert_outputs, dim=0)
+        # Unsort back to original (N*topk,) order, then sum over topk dim
+        out_flat = torch.zeros_like(sorted_out)
+        out_flat[sorted_order] = sorted_out
+        out = out_flat.view(N, self.topk, D).sum(dim=1)  # (N, D)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
@@ -566,12 +586,13 @@ def loop_index_embedding(
     """
     freqs = 1.0 / (
         theta
-        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
+        ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=torch.float32) / loop_dim)
     )
     angles = loop_t * freqs  # (loop_dim//2,)
     emb = torch.cat([angles.sin(), angles.cos()], dim=-1)[:loop_dim]
-    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=h.dtype)
+    emb_full = torch.zeros(h.shape[-1], device=h.device, dtype=torch.float32)
     emb_full[:loop_dim] = emb
+    emb_full = emb_full.to(h.dtype)
     return h + emb_full.unsqueeze(0).unsqueeze(0)
 
 
@@ -622,7 +643,7 @@ class LoRAAdapter(nn.Module):
         s = self.scale(torch.tensor(t_idx, device=x.device))  # (rank,)
         x = x.to(self.down.weight.dtype)  # align with FSDP param dtype
         down = self.down(x) * s  # (B, T, rank)
-        return down @ self.B  # (B, T, dim)
+        return down @ self.B.to(down.dtype)  # (B, T, dim)
 
 
 # ---------------------------------------------------------------------------
@@ -891,8 +912,32 @@ class RecurrentBlock(nn.Module):
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
-                break
+            if kv_cache is None:
+                all_halted = halted.all()
+                # Under FSDP/DDP each rank has different data, so halted.all()
+                # can differ across ranks.  If one rank breaks out of the loop
+                # while others continue, the FSDP all-gather inside self.block
+                # deadlocks (the exited rank never issues the collective).
+                # All-reduce with MIN so ranks only exit together.
+                # The all-reduce is unconditional — every rank must participate
+                # regardless of its local halting state.
+                if torch.distributed.is_initialized():
+                    flag = torch.tensor(
+                        [all_halted], dtype=torch.int32, device=h.device
+                    )
+                    torch.distributed.all_reduce(
+                        flag, op=torch.distributed.ReduceOp.MIN
+                    )
+                    all_halted = flag.item() > 0
+                if all_halted:
+                    break
+
+        # Assign remainder weight for positions that never halted within n_loops.
+        # Without this, non-halted positions have weights summing to < 1.0.
+        not_halted = ~halted
+        if not_halted.any():
+            final_remainder = (1.0 - cumulative_p).clamp(min=0) * not_halted.float()
+            h_out = h_out + final_remainder.unsqueeze(-1) * h
 
         return h_out
 
