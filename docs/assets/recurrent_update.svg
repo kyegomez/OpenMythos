@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="780" viewBox="0 0 1500 780" fill="none">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1500" y2="780" gradientUnits="userSpaceOnUse">
+    <stop offset="0%" stop-color="#07111f"/>
+    <stop offset="60%" stop-color="#0b1630"/>
+    <stop offset="100%" stop-color="#0e1020"/>
+  </linearGradient>
+  <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#11213c" stop-opacity="0.92"/>
+    <stop offset="100%" stop-color="#0a152b" stop-opacity="0.92"/>
+  </linearGradient>
+  <linearGradient id="accent1" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#68e1fd"/>
+    <stop offset="100%" stop-color="#4f46e5"/>
+  </linearGradient>
+  <linearGradient id="accent2" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#7cf29a"/>
+    <stop offset="100%" stop-color="#0ea5a5"/>
+  </linearGradient>
+  <linearGradient id="accent3" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#f0abfc"/>
+    <stop offset="100%" stop-color="#8b5cf6"/>
+  </linearGradient>
+  <filter id="shadow" x="-20%" y="-20%" width="160%" height="160%">
+    <feDropShadow dx="0" dy="12" stdDeviation="20" flood-color="#020617" flood-opacity="0.55"/>
+  </filter>
+  <filter id="glow1" x="-50%" y="-50%" width="200%" height="200%">
+    <feGaussianBlur stdDeviation="14" result="blur"/>
+    <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <marker id="arrow" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
+    <path d="M0 0L14 7L0 14Z" fill="#74d9ff"/>
+  </marker>
+  <marker id="arrowGreen" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
+    <path d="M0 0L14 7L0 14Z" fill="#67e8b7"/>
+  </marker>
+  <marker id="arrowPurple" markerWidth="14" markerHeight="14" refX="10" refY="7" orient="auto">
+    <path d="M0 0L14 7L0 14Z" fill="#c084fc"/>
+  </marker>
+</defs>
+
+<style>
+    .title { font: 700 34px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #e6eef8; }
+    .subtitle { font: 500 18px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #9fb3c8; }
+    .label { font: 600 18px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #dfe8f3; }
+    .body { font: 400 16px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #b8c7d9; }
+    .mono { font: 500 16px 'JetBrains Mono', 'Consolas', monospace; fill: #dff7ff; }
+    .small { font: 400 13px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #94a9bf; }
+    .tiny { font: 500 12px 'Inter', 'Segoe UI', Arial, sans-serif; fill: #8aa0b7; letter-spacing: 0.08em; text-transform: uppercase; }
+</style>
+
+<rect width="1500" height="780" rx="28" fill="url(#bg)"/>
+
+<g opacity="0.9">
+  <circle cx="190" cy="160" r="130" fill="#0ea5e9" opacity="0.08"/>
+  <circle cx="1270" cy="620" r="180" fill="#8b5cf6" opacity="0.10"/>
+</g>
+<text x="90" y="86" class="tiny">Single-step recurrence</text>
+<text x="90" y="132" class="title">Update rule inside one loop iteration</text>
+<text x="90" y="170" class="subtitle">The next hidden state combines persistent memory, fresh input injection, and nonlinear transformer computation.</text>
+
+<g filter="url(#shadow)">
+  <rect x="90" y="290" width="220" height="124" rx="24" fill="url(#panel)" stroke="#2a4665" stroke-width="2"/>
+  <text x="128" y="338" class="tiny">State</text>
+  <text x="128" y="376" class="label">h<tspan baseline-shift="sub" font-size="12">t</tspan></text>
+
+  <rect x="90" y="472" width="220" height="124" rx="24" fill="url(#panel)" stroke="#2a4665" stroke-width="2"/>
+  <text x="128" y="520" class="tiny">Encoded input</text>
+  <text x="128" y="558" class="label">e</text>
+
+  <rect x="410" y="250" width="240" height="96" rx="22" fill="url(#panel)" stroke="#3273a0" stroke-width="2"/>
+  <text x="448" y="308" class="label">A · h<tspan baseline-shift="sub" font-size="12">t</tspan></text>
+
+  <rect x="410" y="488" width="240" height="96" rx="22" fill="url(#panel)" stroke="#3273a0" stroke-width="2"/>
+  <text x="448" y="546" class="label">B · e</text>
+
+  <rect x="720" y="320" width="310" height="188" rx="30" fill="url(#panel)" stroke="#2fb4a3" stroke-width="2"/>
+  <text x="752" y="368" class="tiny">Nonlinear shared block</text>
+  <text x="752" y="410" class="label">Transformer(h<tspan baseline-shift="sub" font-size="12">t</tspan>, e)</text>
+  <text x="752" y="446" class="body">Attention + MoE / MLP +</text>
+  <text x="752" y="470" class="body">residual processing.</text>
+
+  <circle cx="1128" cy="414" r="66" fill="#0f2238" stroke="#4dc7ff" stroke-width="2.4"/>
+  <text x="1106" y="424" class="label">+</text>
+
+  <rect x="1240" y="352" width="190" height="124" rx="24" fill="url(#panel)" stroke="#5d6fe8" stroke-width="2"/>
+  <text x="1276" y="400" class="tiny">Next state</text>
+  <text x="1276" y="438" class="label">h<tspan baseline-shift="sub" font-size="12">t+1</tspan></text>
+</g>
+
+<path d="M310 352 C350 352, 364 298, 410 298" stroke="#74d9ff" stroke-width="5" marker-end="url(#arrow)"/>
+<path d="M310 534 C350 534, 364 536, 410 536" stroke="#74d9ff" stroke-width="5" marker-end="url(#arrow)"/>
+<path d="M310 338 C470 338, 558 338, 720 368" stroke="#67e8b7" stroke-width="4.5" marker-end="url(#arrowGreen)"/>
+<path d="M310 534 C470 534, 558 492, 720 458" stroke="#67e8b7" stroke-width="4.5" marker-end="url(#arrowGreen)"/>
+
+<path d="M650 298 C820 298, 920 328, 1080 392" stroke="#74d9ff" stroke-width="5" marker-end="url(#arrow)"/>
+<path d="M650 536 C820 536, 930 490, 1080 432" stroke="#74d9ff" stroke-width="5" marker-end="url(#arrow)"/>
+<path d="M1030 414 C1060 414, 1066 414, 1062 414" stroke="#67e8b7" stroke-width="5" marker-end="url(#arrowGreen)"/>
+<path d="M1194 414 C1212 414, 1220 414, 1240 414" stroke="#c084fc" stroke-width="5" marker-end="url(#arrowPurple)"/>
+
+<rect x="90" y="650" width="1340" height="74" rx="22" fill="#0b1526" stroke="#22314a" stroke-width="1.5"/>
+<text x="118" y="696" class="mono">h(t+1) = A·h(t) + B·e + Transformer(h(t), e)</text>
+
+</svg>

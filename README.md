@@ -32,6 +32,23 @@
 OpenMythos is an open-source, theoretical implementation of the Claude Mythos model. It implements a Recurrent-Depth Transformer (RDT) with three stages: **Prelude** (transformer blocks), a looped **Recurrent Block** (up to `max_loop_iters`), and a final **Coda**. Attention is switchable between MLA and GQA, and the feed-forward uses a sparse MoE with routed and shared experts ideal for exploring compute-adaptive, depth-variable reasoning.
 
 
+## Visual Overview
+
+OpenMythos follows a three-stage recurrent-depth pipeline: a one-pass **Prelude** encodes the input, a shared **Recurrent Block** performs variable-depth latent computation by looping over the hidden state, and a one-pass **Coda** produces the final representation before decoding.
+
+<p align="center">
+  <img src="docs/assets/architecture_overview.svg" alt="OpenMythos architecture overview" width="100%">
+</p>
+
+The recurrence itself is the core mechanism:
+
+<p align="center">
+  <img src="docs/assets/recurrent_update.svg" alt="Single-step recurrent update rule" width="100%">
+</p>
+
+This design separates **parameter count** from **reasoning depth**: increasing loop count adds inference-time compute and latent reasoning steps without requiring a fresh stack of parameters at every depth.
+
+
 ## Installation
 
 ```bash
@@ -187,34 +204,29 @@ This is not chain-of-thought. There is no intermediate token output. All of this
 
 ## Architecture
 
-A looped transformer divides its layers into three functional blocks:
+A looped transformer divides its layers into three functional blocks: a **Prelude** that runs once, a **Recurrent Block** that can be iterated for variable-depth reasoning, and a **Coda** that runs once to finalize the representation.
 
-```
-Input
-  ↓
-[Prelude P]        — standard transformer layers, run once
-  ↓
-[Recurrent Block R] — looped T times
-  ↑_______↓         (hidden state h updated each loop with input injection e)
-  ↓
-[Coda C]           — standard transformer layers, run once
-  ↓
-Output
-```
+<p align="center">
+  <img src="docs/assets/architecture_overview.svg" alt="OpenMythos architecture overview" width="100%">
+</p>
 
-The recurrent block update rule at each loop step t:
+At loop step `t`, the recurrent block updates its hidden state according to:
 
-```
+```math
 h_{t+1} = A·h_t + B·e + Transformer(h_t, e)
 ```
 
 Where:
-- `h_t` is the hidden state after loop t
-- `e` is the encoded input (from the Prelude), injected at every loop
+- `h_t` is the hidden state after loop `t`
+- `e` is the encoded input from the Prelude, reinjected at every loop
 - `A` and `B` are learned injection parameters
-- The Transformer blocks apply attention and MLP as usual
+- `Transformer(h_t, e)` applies the shared attention and feed-forward computation
 
-The injection of `e` at every step is what prevents the model from drifting — it keeps the original input signal alive throughout the entire recurrence depth.
+<p align="center">
+  <img src="docs/assets/recurrent_update.svg" alt="Single-step recurrent update rule" width="100%">
+</p>
+
+The repeated injection of `e` prevents the loop from drifting too far from the original signal while still allowing the hidden state to evolve across iterations. In practice, this is what turns the recurrent block into a controllable depth mechanism rather than a simple repeated residual stack.
 
 The full implementation is in [`open_mythos/main.py`](open_mythos/main.py). See the [`OpenMythos` class reference](docs/open_mythos.md) for a detailed API walkthrough, configuration options, and usage examples.
 
@@ -276,6 +288,11 @@ Training looped models is notoriously unstable. Two failure modes dominate:
 
 Recast looping as a discrete linear time-invariant (LTI) dynamical system over the residual stream. Ignoring the nonlinear Transformer contribution, the recurrence becomes:
 
+<p align="center">
+  <img src="docs/assets/stability_phase_map.svg" alt="Stability phase map for recurrent injection" width="100%">
+</p>
+
+
 ```
 h_{t+1} = A·h_t + B·e
 ```
@@ -300,6 +317,13 @@ The result: the looped model becomes significantly more robust to hyperparameter
 ---
 
 ## Scaling Laws for Looped Models
+
+The central practical claim is that quality improves as inference-time loop count increases, but with diminishing returns. The shape is not linear; it follows a smooth, saturating curve where extra depth helps most in the early and middle regime and then gradually tapers off.
+
+<p align="center">
+  <img src="docs/assets/depth_scaling_curve.svg" alt="Inference-time scaling curve for looped depth" width="100%">
+</p>
+
 
 Parcae establishes the first predictable scaling laws for looped training:
 
