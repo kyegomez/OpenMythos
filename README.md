@@ -5,6 +5,15 @@
 OpenMythos is an open-source, theoretical implementation of the Claude Mythos model. It implements a Recurrent-Depth Transformer (RDT) with three stages: **Prelude** (transformer blocks), a looped **Recurrent Block** (up to `max_loop_iters`), and a final **Coda**. Attention is switchable between MLA and GQA, and the feed-forward uses a sparse MoE with routed and shared experts ideal for exploring compute-adaptive, depth-variable reasoning.
 
 
+## Trained Checkpoints (MLX fork)
+
+| Model | Steps | Best Loss | Checkpoint | Phase |
+|-------|-------|-----------|-----------|-------|
+| 1b-mythos | 60,000 | **1.0225** | `ckpt/1b-mythos/step_060000.npz` | M4 (lr=1e-8) |
+
+Training config: `vocab_size=50257`, `dim=2048`, `n_heads=16`, `n_experts=16`, `max_seq_len=1024`, `n_loops=4`, GPT-2 tokenizer.  
+All-phase loss history: 1.096 → 1.046 → 1.027 → **1.023**.
+
 ## Installation
 
 ```bash
