@@ -1,5 +1,3 @@
-<<<<<<< HEAD
- 
 import torch
 from open_mythos import OpenMythos, mythos_1b  # Original from fork
 
@@ -76,4 +74,4 @@ if __name__ == '__main__':
     task = sys.argv[1] if len(sys.argv) > 1 else "Demo mesh"
     result = launch_swarm(task)
     print("\nSwarm Meshed Complete:", result["merged"])
->>>>>>> 2fe77967570617ec3c5852828cfa43de48af24ff
+ 2fe77967570617ec3c5852828cfa43de48af24ff
