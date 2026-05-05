@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "open-mythos"
-version = "0.4.0"
+version = "0.5.0"
 description = "OpenMythos — open-source theoretical reconstruction of the Claude Mythos Recurrent-Depth Transformer architecture"
 license = "MIT"
 authors = ["Kye Gomez <kye@swarms.world>"]
@@ -41,6 +41,13 @@ python = ">=3.10,<4.0"
 torch = "2.11.0"
 transformers = ">=4.40.0"
 datasets = ">=2.18.0"
+
+[tool.poetry.extras]
+flash = ["flash-attn"]
+
+[tool.poetry.dependencies.flash-attn]
+version = ">=2.8.3"
+optional = true
 
 
 [tool.poetry.group.lint.dependencies]
