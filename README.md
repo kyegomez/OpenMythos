@@ -46,6 +46,12 @@ To enable Flash Attention 2 in `GQAttention` (requires CUDA and build tools):
 pip install open-mythos[flash]
 ```
 
+> **Optional speedup:** `flash-attn` delivers roughly 30% throughput improvement on
+> CUDA hardware. If it is absent (Intel Mac, ROCm, CPU-only, or missing build
+> tools) the model automatically falls back to standard scaled-dot-product
+> attention — no code change required. All functionality is identical; only
+> throughput differs.
+
 ## Usage
 
 ```python
