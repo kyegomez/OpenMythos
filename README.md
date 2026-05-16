@@ -96,8 +96,12 @@ print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
 out = model.generate(ids, max_new_tokens=8, n_loops=8)
 print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
 
-A = model.recurrent.injection.get_A()
-rho = torch.linalg.eigvals(A).abs().max().item()
+A_diag = model.recurrent.injection.get_A()
+# get_A() returns the diagonal of A_discrete as a 1-D tensor.
+# For a diagonal matrix eigenvalues == diagonal entries, so spectral
+# radius = max(|diag|).  torch.linalg.eigvals requires a 2-D input,
+# so we use abs().max() on the 1-D vector directly — faster and correct.
+rho = A_diag.abs().max().item()
 print(
     f"[{attn_type.upper()}] Spectral radius ρ(A) = {rho:.4f} (must be < 1)"
 )
