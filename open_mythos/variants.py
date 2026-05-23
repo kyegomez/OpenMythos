@@ -1,5 +1,57 @@
 from open_mythos.main import MythosConfig
 
+# ---------------------------------------------------------------------------
+# TINY_CONFIG — unit testing + CPU smoke testing only
+# ---------------------------------------------------------------------------
+
+
+def mythos_tiny() -> MythosConfig:
+    """Tiny config for unit tests and CPU smoke tests.
+
+    Targets roughly 1-3M parameters so that tests complete in seconds on
+    any machine without a GPU.  Not suitable for training or inference on
+    real text — use mythos_1b() or larger for that.
+
+    Architecture choices:
+    - dim=128, n_heads=4 (head_dim=32, fits comfortably in CPU cache)
+    - MLA attention with minimal lora ranks
+    - n_experts=2, n_shared_experts=1, n_experts_per_tok=1 (minimal MoE)
+    - recurrent_iters (max_loop_iters)=2
+    - prelude_layers=1, coda_layers=1
+    - vocab_size=1000, max_seq_len=64
+    """
+    return MythosConfig(
+        vocab_size=1000,
+        dim=128,
+        n_heads=4,
+        n_kv_heads=4,
+        max_seq_len=64,
+        max_loop_iters=2,
+        prelude_layers=1,
+        coda_layers=1,
+        attn_type="mla",
+        kv_lora_rank=32,
+        q_lora_rank=64,
+        qk_rope_head_dim=16,
+        qk_nope_head_dim=16,
+        v_head_dim=16,
+        n_experts=2,
+        n_shared_experts=1,
+        n_experts_per_tok=1,
+        expert_dim=32,
+        act_threshold=0.99,
+        rope_theta=10000.0,
+        lora_rank=4,
+        dropout=0.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TINY_CONFIG singleton — import directly for convenience in tests
+# ---------------------------------------------------------------------------
+
+TINY_CONFIG = mythos_tiny()
+
 # Parameter budget breakdown per variant:
 #   total ≈ embed + prelude/coda dense blocks + recurrent MLA + MoE
 #   MoE   = 3 * dim * expert_dim * (n_experts + n_shared * n_experts_per_tok)
