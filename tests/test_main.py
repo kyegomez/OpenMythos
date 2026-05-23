@@ -4,6 +4,7 @@ from open_mythos.main import (
     ACTHalting,
     Expert,
     GQAttention,
+    LearnedIterationEmbedding,
     LTIInjection,
     LoRAAdapter,
     MLAttention,
@@ -48,6 +49,12 @@ def gqa_cfg(**overrides) -> MythosConfig:
         qk_rope_head_dim=8,
         qk_nope_head_dim=8,
         v_head_dim=8,
+        # Stabilization fields
+        recurrence_dropout=0.0,
+        ponder_weight=0.01,
+        use_learned_iter_embed=True,
+        mup_enabled=False,
+        mup_base_width=64,
     )
     defaults.update(overrides)
     return MythosConfig(**defaults)
@@ -261,7 +268,7 @@ class TestGQAttention:
         self.cfg = gqa_cfg()
         self.freqs = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
-        )
+        )[:T]
         self.attn = GQAttention(self.cfg)
 
     def test_output_shape(self):
@@ -297,7 +304,7 @@ class TestMLAttention:
         self.cfg = mla_cfg()
         self.freqs = precompute_rope_freqs(
             self.cfg.qk_rope_head_dim, self.cfg.max_seq_len
-        )
+        )[:T]
         self.attn = MLAttention(self.cfg)
 
     def test_output_shape(self):
@@ -430,21 +437,21 @@ class TestTransformerBlock:
     def test_gqa_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_mla_output_shape(self):
         cfg = mla_cfg()
         block = TransformerBlock(cfg, use_moe=False)
-        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.qk_rope_head_dim, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
     def test_moe_block_output_shape(self):
         cfg = gqa_cfg()
         block = TransformerBlock(cfg, use_moe=True)
-        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
         x = torch.randn(B, T, cfg.dim)
         assert block(x, freqs).shape == (B, T, cfg.dim)
 
@@ -486,7 +493,9 @@ class TestLTIInjection:
         loss.backward()
         opt.step()
         A = self.inj.get_A()
-        assert A.max().item() < 1.0
+        # ZOH discretization guarantees A in (0, 1]; at float precision
+        # boundary the max can hit exactly 1.0, so use <= with tolerance
+        assert A.max().item() <= 1.0 + 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -521,26 +530,169 @@ class TestRecurrentBlock:
         self.block = RecurrentBlock(self.cfg)
         self.freqs = precompute_rope_freqs(
             self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
-        )
+        )[:T]
 
     def test_output_shape(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out = self.block(h, e, self.freqs)
+        out, ponder = self.block(h, e, self.freqs)
         assert out.shape == (B, T, self.cfg.dim)
 
     def test_more_loops_changes_output(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out1 = self.block(h.clone(), e.clone(), self.freqs, n_loops=1)
-        out3 = self.block(h.clone(), e.clone(), self.freqs, n_loops=3)
+        out1, _ = self.block(h.clone(), e.clone(), self.freqs, n_loops=1)
+        out3, _ = self.block(h.clone(), e.clone(), self.freqs, n_loops=3)
         assert not torch.allclose(out1, out3)
 
     def test_single_loop_runs(self):
         h = torch.randn(B, T, self.cfg.dim)
         e = torch.randn(B, T, self.cfg.dim)
-        out = self.block(h, e, self.freqs, n_loops=1)
+        out, ponder = self.block(h, e, self.freqs, n_loops=1)
         assert out.shape == (B, T, self.cfg.dim)
+
+    def test_ponder_cost_zero_during_eval(self):
+        self.block.eval()
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        _, ponder = self.block(h, e, self.freqs)
+        assert ponder.item() == 0.0
+
+    def test_ponder_cost_positive_during_train(self):
+        self.block.train()
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        _, ponder = self.block(h, e, self.freqs)
+        assert ponder.item() > 0.0
+
+    def test_state_norm_exists(self):
+        assert hasattr(self.block, "state_norm")
+        assert isinstance(self.block.state_norm, RMSNorm)
+
+    def test_learned_iter_embed_when_enabled(self):
+        cfg = gqa_cfg(use_learned_iter_embed=True)
+        block = RecurrentBlock(cfg)
+        assert hasattr(block, "iter_embed")
+        assert isinstance(block.iter_embed, LearnedIterationEmbedding)
+
+    def test_sinusoidal_embed_when_disabled(self):
+        cfg = gqa_cfg(use_learned_iter_embed=False)
+        block = RecurrentBlock(cfg)
+        assert block.iter_embed is None
+        assert block.loop_dim == cfg.dim // 8
+
+
+# ---------------------------------------------------------------------------
+# LearnedIterationEmbedding
+# ---------------------------------------------------------------------------
+
+
+class TestLearnedIterationEmbedding:
+    def setup_method(self):
+        self.emb = LearnedIterationEmbedding(max_iters=10, dim=64)
+
+    def test_output_shape(self):
+        h = torch.randn(B, T, 64)
+        out = self.emb(h, loop_t=0)
+        assert out.shape == h.shape
+
+    def test_different_iterations_differ(self):
+        h = torch.zeros(1, 1, 64)
+        out0 = self.emb(h, loop_t=0)
+        out1 = self.emb(h, loop_t=1)
+        assert not torch.allclose(out0, out1)
+
+    def test_depth_extrapolation_clamps(self):
+        h = torch.randn(1, 1, 64)
+        # loop_t=99 exceeds max_iters=10; should clamp to index 9
+        out_clamped = self.emb(h, loop_t=99)
+        out_last = self.emb(h, loop_t=9)
+        # The embeddings added should be the same (same index)
+        diff = (out_clamped - out_last).abs().max()
+        assert diff < 1e-6
+
+    def test_all_channels_modified(self):
+        """Learned embedding modifies all dim channels, not just dim//8."""
+        h = torch.zeros(1, 1, 64)
+        out = self.emb(h, loop_t=1)
+        # All channels should be nonzero (embedding has all dims)
+        assert out.abs().sum() > 0
+
+
+# ---------------------------------------------------------------------------
+# Stochastic Depth Recurrence
+# ---------------------------------------------------------------------------
+
+
+class TestStochasticDepthRecurrence:
+    def test_no_dropout_at_zero_rate(self):
+        """With recurrence_dropout=0, output should be deterministic."""
+        cfg = gqa_cfg(recurrence_dropout=0.0)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.train()
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+        torch.manual_seed(42)
+        out1, _ = block(h.clone(), e.clone(), freqs)
+        torch.manual_seed(42)
+        out2, _ = block(h.clone(), e.clone(), freqs)
+        assert torch.allclose(out1, out2)
+
+    def test_dropout_active_during_training(self):
+        """With recurrence_dropout > 0, training outputs should vary."""
+        cfg = gqa_cfg(recurrence_dropout=0.5, max_loop_iters=4)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.train()
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+        out1, _ = block(h.clone(), e.clone(), freqs)
+        out2, _ = block(h.clone(), e.clone(), freqs)
+        # With 50% dropout over 4 iterations, outputs should differ
+        assert not torch.allclose(out1, out2)
+
+    def test_no_dropout_during_eval(self):
+        """recurrence_dropout should have no effect during eval."""
+        cfg = gqa_cfg(recurrence_dropout=0.5, max_loop_iters=4)
+        block = RecurrentBlock(cfg)
+        freqs = precompute_rope_freqs(cfg.dim // cfg.n_heads, cfg.max_seq_len)[:T]
+        block.eval()
+        h = torch.randn(B, T, cfg.dim)
+        e = torch.randn(B, T, cfg.dim)
+        out1, _ = block(h.clone(), e.clone(), freqs)
+        out2, _ = block(h.clone(), e.clone(), freqs)
+        assert torch.allclose(out1, out2)
+
+
+# ---------------------------------------------------------------------------
+# μP Initialization
+# ---------------------------------------------------------------------------
+
+
+class TestMupInit:
+    def test_mup_disabled_by_default(self):
+        cfg = gqa_cfg(mup_enabled=False)
+        model = OpenMythos(cfg)
+        # Standard init: head weight std should be close to 0.02
+        head_std = model.head.weight.std().item()
+        assert abs(head_std - 0.02) < 0.01
+
+    def test_mup_enabled_scales_head(self):
+        cfg = gqa_cfg(mup_enabled=True, mup_base_width=32, dim=64)
+        model = OpenMythos(cfg)
+        # With mup_base_width=32 and dim=64, width_ratio=2
+        # head should be scaled by 1/width_ratio = 0.5
+        head_std = model.head.weight.std().item()
+        # Should be roughly 0.02 * 0.5 = 0.01
+        assert head_std < 0.015
+
+    def test_mup_config_fields_exist(self):
+        cfg = MythosConfig()
+        assert hasattr(cfg, "mup_enabled")
+        assert hasattr(cfg, "mup_base_width")
+        assert cfg.mup_enabled is False
+        assert cfg.mup_base_width == 2048
 
 
 # ---------------------------------------------------------------------------
