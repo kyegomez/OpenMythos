@@ -7,6 +7,14 @@ Single GPU:
 
 Multi-GPU:
     torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
+
+Troubleshooting:
+    - macOS MPS: If you get '[Errno 9] Bad file descriptor', run:
+        ulimit -n 10000
+      This increases the file descriptor limit for the HuggingFace datasets library.
+    - Network issues: The script now retries dataset loading up to 5 times.
+    - For large datasets, consider downloading first:
+        huggingface-cli download HuggingFaceFW/fineweb-edu --repo-type dataset
 """
 
 import os
@@ -89,12 +97,33 @@ class FineWebEduDataset(IterableDataset):
         total_shards = self.world_size * num_workers
         shard_index = self.rank * num_workers + worker_id
 
-        ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name=self.subset,
-            split="train",
-            streaming=True,
-        ).shard(num_shards=total_shards, index=shard_index)
+        # Retry logic for dataset loading (fix for issue #71)
+        # The '[Errno 9] Bad file descriptor' error occurs on macOS MPS
+        # and when file descriptor limits are too low.
+        max_retries = 5
+        retry_delay = 2.0  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                ds = load_dataset(
+                    "HuggingFaceFW/fineweb-edu",
+                    name=self.subset,
+                    split="train",
+                    streaming=True,
+                ).shard(num_shards=total_shards, index=shard_index)
+                break
+            except OSError as e:
+                if e.errno == 9:  # Bad file descriptor
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    raise RuntimeError(
+                        f"Failed to load dataset after {max_retries} attempts. "
+                        f"On macOS, try: ulimit -n 10000\n"
+                        f"Original error: {e}"
+                    ) from e
+                raise
 
         buf = []
         for sample in ds:
