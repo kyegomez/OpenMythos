@@ -77,6 +77,14 @@ class MythosConfig:
     lora_rank: int = 16
     # Maximum tokens to generate per forward pass
     max_output_tokens: int = 4096
+    # Recurrence stabilization
+    recurrence_dropout: float = 0.0  # stochastic depth dropout rate for recurrent iterations
+    ponder_weight: float = 0.01  # ACT ponder cost regularization weight
+    use_learned_iter_embed: bool = True  # learned vs sinusoidal loop-index embeddings
+    state_norm_eps: float = 1e-5  # eps for post-injection recurrent state normalization
+    # μP (maximal update parameterization)
+    mup_enabled: bool = False  # enable μP scaling rules
+    mup_base_width: int = 2048  # reference width for μP hyperparameter transfer
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
 
@@ -570,6 +578,45 @@ def loop_index_embedding(
     return h + emb_full.unsqueeze(0).unsqueeze(0)
 
 
+class LearnedIterationEmbedding(nn.Module):
+    """
+    Learned per-iteration embedding injected into the hidden state at each loop step.
+
+    Compared to the sinusoidal loop_index_embedding, a learned embedding table provides
+    richer per-iteration differentiation across all dim channels (not just dim//8),
+    directly addressing representation collapse at high loop counts. Each iteration t
+    receives a unique learned vector that shifts the hidden state into a distinct
+    representational regime, forcing the shared transformer block to implement
+    functionally distinct operations at each depth.
+
+    For depth extrapolation beyond max_iters, the embedding is clamped to the last
+    trained iteration to avoid out-of-range indexing.
+    """
+
+    def __init__(self, max_iters: int, dim: int):
+        """
+        Args:
+            max_iters -- maximum number of loop iterations (embedding table size)
+            dim       -- model hidden dimension
+        """
+        super().__init__()
+        self.embed = nn.Embedding(max_iters, dim)
+        nn.init.normal_(self.embed.weight, std=0.02)
+
+    def forward(self, h: torch.Tensor, loop_t: int) -> torch.Tensor:
+        """
+        Args:
+            h      -- hidden state of shape (B, T, dim)
+            loop_t -- current loop iteration index (0-based)
+
+        Returns:
+            h with the learned iteration embedding added; same shape
+        """
+        max_t = self.embed.num_embeddings - 1
+        t_idx = min(loop_t, max_t)
+        return h + self.embed(torch.tensor(t_idx, device=h.device, dtype=torch.long))
+
+
 # ---------------------------------------------------------------------------
 # Depth-wise LoRA adapter (per loop iteration)
 # ---------------------------------------------------------------------------
@@ -749,7 +796,7 @@ class LTIInjection(nn.Module):
 
 class ACTHalting(nn.Module):
     """
-    Adaptive Computation Time halting mechanism (Graves, 2016).
+    Adaptive Computation Time halting mechanism (Graves, 2016) with ponder cost.
 
     Learns a per-position halting probability at each loop iteration. Positions
     where the hidden state has converged (high cumulative halting probability)
@@ -757,15 +804,22 @@ class ACTHalting(nn.Module):
     This lets easy tokens halt early and hard tokens receive more computation,
     all within the same batch. Also makes the model Turing-complete under
     certain assumptions about the expressiveness of the transformer block.
+
+    The ponder cost regularization penalizes the total number of steps taken,
+    encouraging the model to halt as early as possible while maintaining quality.
+    This prevents the model from wasting compute on iterations that don't improve
+    the representation.
     """
 
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, ponder_weight: float = 0.01):
         """
         Args:
-            dim -- hidden state dimension; input to the halting scalar predictor
+            dim           -- hidden state dimension; input to the halting scalar predictor
+            ponder_weight -- regularization weight for the ponder cost (total steps penalty)
         """
         super().__init__()
         self.halt = nn.Linear(dim, 1)
+        self.ponder_weight = ponder_weight
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         """
@@ -790,17 +844,26 @@ class RecurrentBlock(nn.Module):
     The core recurrent block of OpenMythos — a single TransformerBlock looped T times.
 
     At each loop iteration t, the hidden state h is updated via:
-        1. loop_index_embedding: inject sinusoidal loop-index signal into h
+        1. iteration embedding:  inject learned (or sinusoidal) loop-index signal into h
         2. TransformerBlock:     compute attention + MoE FFN on normalized (h + e)
         3. LoRAAdapter:          apply depth-wise LoRA delta to transformer output
-        4. LTIInjection:         stable update h = A·h + B·e + transformer_out
-        5. ACTHalting:           accumulate per-position halting probabilities;
-                                  positions that have converged stop contributing
+        4. Stochastic depth:     randomly skip transformer contribution during training
+        5. LTIInjection:         stable update h = A·h + B·e + transformer_out
+        6. RecurrentStateNorm:   normalize h to prevent norm explosion across iterations
+        7. ACTHalting:           accumulate per-position halting probabilities;
+                                 positions that have converged stop contributing
 
     The encoded input e (output of the Prelude) is injected at every step to keep
     the original input signal alive across arbitrary loop depth, preventing drift.
     The ACT mechanism produces a weighted sum of hidden states across iterations,
     where the weights reflect when each position converged.
+
+    Stabilization features for deep recurrence (T >= 32):
+    - Post-injection RMSNorm prevents residual norm explosion
+    - Stochastic depth recurrence drops later iterations more frequently
+    - Learned iteration embeddings differentiate all dim channels per iteration
+    - Ponder cost regularization penalizes excessive computation
+    - μP-compatible initialization when enabled
 
     More loop iterations at inference = deeper reasoning chains, following the
     depth-extrapolation property of looped transformers (Saunshi et al., 2025).
@@ -809,18 +872,34 @@ class RecurrentBlock(nn.Module):
     def __init__(self, cfg: MythosConfig):
         """
         Args:
-            cfg -- MythosConfig; uses dim, lora_rank, max_loop_iters, act_threshold
+            cfg -- MythosConfig; uses dim, lora_rank, max_loop_iters, act_threshold,
+                   recurrence_dropout, ponder_weight, use_learned_iter_embed
         """
         super().__init__()
         self.cfg = cfg
         self.block = TransformerBlock(cfg, use_moe=True)
         self.injection = LTIInjection(cfg.dim)
-        self.act = ACTHalting(cfg.dim)
+        self.act = ACTHalting(cfg.dim, ponder_weight=cfg.ponder_weight)
         self.lora = LoRAAdapter(cfg.dim, cfg.lora_rank, cfg.max_loop_iters)
         self.norm = RMSNorm(cfg.dim)
-        self.loop_dim = (
-            cfg.dim // 8
-        )  # fraction of channels receiving loop-index embedding
+
+        # Post-injection state normalization: prevents norm explosion across iterations.
+        # Without this, the residual stream grows as O(sqrt(T)) over T loop steps.
+        self.state_norm = RMSNorm(cfg.dim, eps=cfg.state_norm_eps)
+
+        # Iteration embedding: learned (richer per-iteration differentiation across all
+        # dim channels) or sinusoidal (only dim//8 channels, but supports extrapolation).
+        if cfg.use_learned_iter_embed:
+            self.iter_embed = LearnedIterationEmbedding(cfg.max_loop_iters, cfg.dim)
+            self.loop_dim = cfg.dim  # learned embed covers all channels
+        else:
+            self.iter_embed = None
+            self.loop_dim = cfg.dim // 8
+
+        # Stochastic depth recurrence: linearly increasing dropout probability with depth.
+        # Later iterations are more likely to be redundant; dropping them prevents gradient
+        # circulation and forces the model to learn useful representations at every depth.
+        self.recurrence_dropout = cfg.recurrence_dropout
 
     def forward(
         self,
@@ -830,7 +909,7 @@ class RecurrentBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
         kv_cache: Optional[dict] = None,
-    ) -> torch.Tensor:
+    ) -> tuple:
         """
         Run the recurrent loop for up to n_loops iterations with ACT early exit.
 
@@ -845,7 +924,9 @@ class RecurrentBlock(nn.Module):
                         each loop iteration uses a separate cache key
 
         Returns:
-            ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            Tuple of (h_out, ponder_cost) where:
+            - h_out: ACT-weighted sum of hidden states across iterations, shape (B, T, dim)
+            - ponder_cost: scalar ponder cost for regularization (0.0 during eval)
         """
         n_loops = n_loops or self.cfg.max_loop_iters
         B, T, D = h.shape
@@ -853,15 +934,49 @@ class RecurrentBlock(nn.Module):
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
         cumulative_p = torch.zeros(B, T, device=h.device)
         h_out = torch.zeros_like(h)
+        ponder_cost = torch.tensor(0.0, device=h.device)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            # 1. Iteration embedding: inject per-loop signal
+            if self.iter_embed is not None:
+                h_loop = self.iter_embed(h, t)
+            else:
+                h_loop = loop_index_embedding(h, t, self.loop_dim)
+
+            # 2. Transformer block on normalized (h + e)
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
+
+            # 3. LoRA depth adaptation
             trans_out = trans_out + self.lora(trans_out, t)
+
+            # 4. Stochastic depth recurrence (training only).
+            #    Drop probability increases linearly with depth: later iterations
+            #    are dropped more often, preventing gradient circulation through
+            #    64 iterations of shared weights and forcing useful computation
+            #    at every depth level.
+            if self.training and self.recurrence_dropout > 0 and n_loops > 1:
+                drop_prob = self.recurrence_dropout * (t / (n_loops - 1))
+                keep_prob = 1.0 - drop_prob
+                # Per-sample binary mask to maintain batch-level independence.
+                # Match dtype to trans_out to prevent silent upcasting in
+                # mixed-precision (bf16/fp16) training.
+                mask_sd = (
+                    torch.rand(B, 1, 1, device=h.device) < keep_prob
+                ).to(trans_out.dtype)
+                trans_out = trans_out * mask_sd / keep_prob
+
+            # 5. LTI-stable injection: h_{t+1} = A·h_t + B·e + transformer_out
             h = self.injection(h, e, trans_out)
 
+            # 6. Recurrent state normalization: prevent norm explosion.
+            #    Critical at T >= 32 where the residual stream grows as O(sqrt(T)).
+            #    The state_norm applies RMSNorm with a learnable rescaling weight,
+            #    keeping the hidden state magnitude bounded across all iterations.
+            h = self.state_norm(h)
+
+            # 7. ACT halting with ponder cost accumulation
             p = self.act(h)  # (B, T)
             still_running = ~halted
 
@@ -882,13 +997,25 @@ class RecurrentBlock(nn.Module):
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
+            # Accumulate ponder cost: penalizes total steps taken per position.
+            # This encourages early halting for easy tokens, preventing the model
+            # from wasting compute on redundant iterations.
+            if self.training:
+                ponder_cost = ponder_cost + cumulative_p[still_running].sum()
+
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
             if halted.all() and kv_cache is None:
                 break
 
-        return h_out
+        # Normalize ponder cost by batch*sequence and scale by weight
+        if self.training:
+            ponder_cost = (
+                self.act.ponder_weight * ponder_cost / (B * T)
+            )
+
+        return h_out, ponder_cost
 
 
 # ---------------------------------------------------------------------------
@@ -917,9 +1044,13 @@ class OpenMythos(nn.Module):
     Key properties:
     - Same weights, more loops → deeper reasoning, no parameter growth
     - Depth extrapolation: train on N loops, test on N+k loops (emergent)
-    - ACT halting: variable compute per position within a batch
+    - ACT halting with ponder cost: variable compute per position, regularized
     - MoE FFN in the recurrent block: breadth across domains
     - LTI-stable injection: spectral radius < 1 guaranteed by construction
+    - Post-injection state norm: prevents norm explosion at deep recurrence
+    - Stochastic depth recurrence: prevents gradient circulation during training
+    - Learned iteration embeddings: prevents representation collapse
+    - μP scaling: hyperparameter transfer across model widths
     - Supports both GQA and MLA attention (set via cfg.attn_type)
     """
 
@@ -955,7 +1086,18 @@ class OpenMythos(nn.Module):
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
         self.head.weight = self.embed.weight  # weight tying
 
+        self._last_ponder_cost = torch.tensor(0.0)
+
         self._init_weights()
+
+        # μP scaling: adjust initialization and register base width for
+        # optimizer-side scaling. When enabled, hidden layer weights are
+        # initialized with std scaled by sqrt(base_width/width), and output
+        # projection weights are scaled by base_width/width, ensuring that
+        # activation magnitudes and gradient magnitudes remain stable across
+        # widths and hyperparameters transfer directly from the base width.
+        if cfg.mup_enabled:
+            self._apply_mup_init()
 
     def _init_weights(self) -> None:
         """Initialize all linear and embedding weights with N(0, 0.02)."""
@@ -964,6 +1106,39 @@ class OpenMythos(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
+
+    def _apply_mup_init(self) -> None:
+        """
+        Apply μP (maximal update parameterization) initialization scaling.
+
+        Implements the width-dependent initialization from Yang et al. (2022):
+        - Output projection (head): std *= base_width / width
+        - All other linear layers: std *= sqrt(base_width / width)
+        - Embeddings: std *= sqrt(base_width / width)
+
+        In μP, only the final logits projection is the "output layer" (inf scaling).
+        Attention output (wo), FFN down, Q/K/V, gate/up are all "hidden layers"
+        (fan-in scaling). This distinction is critical: applying 1/width to hidden
+        layers would over-attenuate internal activations and break training dynamics.
+
+        The width ratio is computed as dim / mup_base_width.
+        """
+        width_ratio = self.cfg.dim / self.cfg.mup_base_width
+        sqrt_ratio = width_ratio ** 0.5
+
+        for name, m in self.named_modules():
+            if isinstance(m, nn.Linear):
+                if name == "head":
+                    # Final logits projection: μP "inf" scaling (1/width)
+                    with torch.no_grad():
+                        m.weight.mul_(1.0 / width_ratio)
+                else:
+                    # All other linear layers: μP "fan-in" scaling (1/sqrt(width))
+                    with torch.no_grad():
+                        m.weight.mul_(1.0 / sqrt_ratio)
+            elif isinstance(m, nn.Embedding):
+                with torch.no_grad():
+                    m.weight.mul_(1.0 / sqrt_ratio)
 
     @staticmethod
     def _causal_mask(
@@ -1012,6 +1187,10 @@ class OpenMythos(nn.Module):
 
         Returns:
             Logits of shape (B, T, vocab_size)
+
+        Note:
+            During training, the ponder cost is stored in self._last_ponder_cost
+            for the training loop to add to the language modeling loss.
         """
         T = input_ids.shape[1]
         device = input_ids.device
@@ -1026,10 +1205,13 @@ class OpenMythos(nn.Module):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"prelude_{i}")
 
         e = x  # encoded input frozen for injection every loop
-        x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
+        x, ponder_cost = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
 
         for i, layer in enumerate(self.coda):
             x = layer(x, freqs_cis, mask, kv_cache, cache_key=f"coda_{i}")
+
+        # Store ponder cost for training loop to add to LM loss
+        self._last_ponder_cost = ponder_cost
 
         return self.head(self.norm(x))
 
