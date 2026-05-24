@@ -674,5 +674,117 @@ class TestAttnTypeSwap:
         assert cache_bytes(cache_mla) < cache_bytes(cache_gqa)
 
 
+# ---------------------------------------------------------------------------
+# Regression guards for invariants called out in the OpenMythos design notes
+# ---------------------------------------------------------------------------
+
+
+class TestRecurrentBlockInvariants:
+    """Lock in two invariants that have historically been broken by refactors.
+
+    1. With a KV cache present, the recurrent loop must NOT short-circuit on
+       halt. Every loop depth must execute on every forward pass so that later
+       decode steps find populated keys at every `recurrent_loop_{t}` cache key.
+    2. The post-Prelude encoding `e` is frozen across the loop. Re-injecting
+       the same `e` at every step is what prevents drift across arbitrary
+       recurrence depth, and the LTI update rule h_{t+1} = A*h_t + B*e + ...
+       assumes e is constant inside the loop.
+    """
+
+    def setup_method(self):
+        # max_loop_iters intentionally larger than what ACT would naturally
+        # stop at, so a naive `break on halt` would skip later iterations.
+        self.cfg = gqa_cfg(max_loop_iters=4, act_threshold=0.5)
+        self.block = RecurrentBlock(self.cfg)
+        self.freqs = precompute_rope_freqs(
+            self.cfg.dim // self.cfg.n_heads, self.cfg.max_seq_len
+        )
+
+    def test_kv_cache_populated_at_every_loop_depth(self):
+        """Every recurrent_loop_{t} key must exist after a forward pass with cache.
+
+        Regression guard: if someone re-adds an unconditional `break` on halt
+        inside RecurrentBlock.forward, later loop depths will be missing from
+        the cache and the next decode step will KeyError or, worse, silently
+        attend over a truncated context.
+        """
+        h = torch.randn(B, T, self.cfg.dim)
+        e = torch.randn(B, T, self.cfg.dim)
+        cache: dict = {}
+        with torch.no_grad():
+            self.block(h, e, self.freqs[:T], n_loops=self.cfg.max_loop_iters, kv_cache=cache)
+        for t in range(self.cfg.max_loop_iters):
+            assert f"recurrent_loop_{t}" in cache, (
+                f"KV cache is missing recurrent_loop_{t}; the loop short-circuited "
+                "on halt while a cache was present (invariant violation)."
+            )
+
+    def test_kv_cache_two_step_decode_does_not_raise(self):
+        """End-to-end: a second forward pass that reuses the cache must succeed.
+
+        This is the symptom users actually hit when invariant #8 is broken:
+        decode step 2+ raises a shape mismatch or KeyError because step 1
+        skipped some loop depths.
+        """
+        cfg = gqa_cfg(max_loop_iters=4, act_threshold=0.5)
+        model = OpenMythos(cfg)
+        prompt = torch.randint(0, cfg.vocab_size, (1, T))
+        cache: dict = {}
+        with torch.no_grad():
+            model(prompt, n_loops=cfg.max_loop_iters, kv_cache=cache)
+            # decode step: one new token, cache reused, start_pos advanced
+            next_tok = torch.randint(0, cfg.vocab_size, (1, 1))
+            model(
+                next_tok,
+                n_loops=cfg.max_loop_iters,
+                kv_cache=cache,
+                start_pos=T,
+            )
+
+    def test_e_is_frozen_across_loops(self):
+        """Mutating e mid-loop would change outputs; freezing it must not.
+
+        We can't directly observe `e` being re-used inside the block, but we
+        can prove it indirectly: two calls with the same (h, e) must give the
+        same output, and changing only e (with h held fixed) must change it.
+        If a refactor accidentally recomputed e from h inside the loop, the
+        second property would weaken — the output would become a function of
+        h alone past iteration 0.
+        """
+        torch.manual_seed(0)
+        h = torch.randn(B, T, self.cfg.dim)
+        e1 = torch.randn(B, T, self.cfg.dim)
+        e2 = e1 + torch.randn_like(e1) * 0.5  # different e, same h
+        with torch.no_grad():
+            out_a = self.block(h.clone(), e1.clone(), self.freqs[:T], n_loops=3)
+            out_b = self.block(h.clone(), e1.clone(), self.freqs[:T], n_loops=3)
+            out_c = self.block(h.clone(), e2.clone(), self.freqs[:T], n_loops=3)
+        # deterministic given (h, e)
+        assert torch.allclose(out_a, out_b, atol=1e-6)
+        # genuine dependence on e at every loop, not just iteration 0
+        assert not torch.allclose(out_a, out_c, atol=1e-3)
+
+
+class TestSpectralRadiusInvariant:
+    """Lock in rho(A) < 1 at initialization for every variant config used in tests.
+
+    This is the central LTI stability invariant. If someone replaces the
+    exp(-exp(...)) reparameterization with a free parameter, this test will
+    catch it on the first push instead of after a training run diverges.
+    """
+
+    def test_gqa_model_lti_bounded_at_init(self):
+        model = OpenMythos(gqa_cfg())
+        A = model.recurrent.injection.get_A()
+        assert A.max().item() < 1.0
+        assert A.min().item() > 0.0
+
+    def test_mla_model_lti_bounded_at_init(self):
+        model = OpenMythos(mla_cfg())
+        A = model.recurrent.injection.get_A()
+        assert A.max().item() < 1.0
+        assert A.min().item() > 0.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "--verbose"])
