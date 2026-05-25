@@ -79,6 +79,18 @@ class MythosConfig:
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
     dropout: float = 0.0
+    # --- Ablation flags (default values preserve the original architecture) ---
+    # These expose five mechanistic knobs that control how each recurrent step
+    # differs from every other. Disabling them individually or in combination
+    # allows practitioners to trade inference-time depth-extrapolation
+    # (monotonic PPL scaling with n_loops at inference) against the default
+    # peak-quality-at-trained-depth behaviour. See the "Depth extrapolation"
+    # section in README.md for the recipe that restores monotonic scaling.
+    loop_index_embedding: bool = True
+    use_per_loop_lora: bool = True
+    disable_act: bool = False
+    freeze_moe_router: bool = False
+    break_recurrence: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -855,12 +867,19 @@ class RecurrentBlock(nn.Module):
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
+            if self.cfg.loop_index_embedding:
+                h_loop = loop_index_embedding(h, t, self.loop_dim)
+            else:
+                h_loop = h
             combined = self.norm(h_loop + e)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
-            trans_out = trans_out + self.lora(trans_out, t)
-            h = self.injection(h, e, trans_out)
+            if self.cfg.use_per_loop_lora:
+                trans_out = trans_out + self.lora(trans_out, t)
+            if self.cfg.break_recurrence:
+                h = trans_out
+            else:
+                h = self.injection(h, e, trans_out)
 
             p = self.act(h)  # (B, T)
             still_running = ~halted
@@ -888,6 +907,8 @@ class RecurrentBlock(nn.Module):
             if halted.all() and kv_cache is None:
                 break
 
+        if self.cfg.disable_act:
+            return h
         return h_out
 
 
