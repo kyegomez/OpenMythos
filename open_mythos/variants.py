@@ -1,4 +1,4 @@
-from open_mythos.main import MythosConfig
+from open_mythos.config import MythosConfig
 
 # Parameter budget breakdown per variant:
 #   total ≈ embed + prelude/coda dense blocks + recurrent MLA + MoE

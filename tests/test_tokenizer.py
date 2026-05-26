@@ -1,5 +1,9 @@
 import pytest
-from open_mythos.tokenizer import MythosTokenizer
+from open_mythos.tokenizer import (
+    MythosTokenizer,
+    get_vocab_size,
+    load_tokenizer,
+)
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +66,15 @@ def test_custom_model_id():
     tok = MythosTokenizer(model_id="openai/gpt-oss-20b")
     print(f"Custom model_id vocab size: {tok.vocab_size:,}")
     assert tok.vocab_size > 0
+
+
+def test_load_tokenizer_helper():
+    tok = load_tokenizer()
+    assert isinstance(tok, MythosTokenizer)
+
+
+def test_get_vocab_size_helper(tokenizer):
+    assert get_vocab_size() == tokenizer.vocab_size
 
 
 def test_vocab_size_consistent(tokenizer):
