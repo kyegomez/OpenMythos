@@ -39,6 +39,7 @@ if __name__ == "__main__":
     labels = torch.randint(0, cfg.vocab_size, (B, T), device=device)
 
     logits, loss = model(input_ids, labels)
+    assert not torch.isnan(loss), "Loss is NaN!"
     assert logits.shape == (B, T, cfg.vocab_size)
     print(f"Logits shape : {logits.shape}")
     print(f"Loss (LM + balance): {loss.item():.4f}")
