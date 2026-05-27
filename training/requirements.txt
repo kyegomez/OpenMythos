@@ -2,3 +2,5 @@ torch>=2.11.0
 datasets>=3.6.0
 loguru>=0.7.3
 open-mythos
+clearml>=1.16.0
+pyarrow>=15.0.0
