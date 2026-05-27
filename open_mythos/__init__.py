@@ -16,6 +16,18 @@ from open_mythos.main import (
     precompute_rope_freqs,
 )
 from open_mythos.tokenizer import MythosTokenizer
+from open_mythos.quantization import (
+    QuantizedLinear,
+    quantize_linear_layer,
+    quantize_moe_experts,
+    quantize_model,
+    get_model_memory_mb,
+    print_quantization_summary,
+)
+from open_mythos.expert_offloader import (
+    ExpertOffloader,
+    create_offloaded_model,
+)
 from open_mythos.variants import (
     mythos_1b,
     mythos_1t,
@@ -52,4 +64,14 @@ __all__ = [
     "load_tokenizer",
     "get_vocab_size",
     "MythosTokenizer",
+    # Quantization
+    "QuantizedLinear",
+    "quantize_linear_layer",
+    "quantize_moe_experts",
+    "quantize_model",
+    "get_model_memory_mb",
+    "print_quantization_summary",
+    # Expert Offloading
+    "ExpertOffloader",
+    "create_offloaded_model",
 ]
