@@ -37,7 +37,7 @@ classifiers = [
 
 
 [tool.poetry.dependencies]
-python = ">=3.10,<4.0"
+python = ">=3.10,<3.15"
 torch = "2.11.0"
 transformers = ">=4.40.0"
 datasets = ">=2.18.0"
