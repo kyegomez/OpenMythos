@@ -2,6 +2,11 @@ from transformers import AutoTokenizer
 
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
 
+# HuggingFace model ID for the MiniMax-M3 tokenizer.
+# Supports vocab_size=200064 — pass this to MythosTokenizer when working
+# with the minimax_m3_config() variant.
+MINIMAX_M3_MODEL_ID = "MiniMaxAI/MiniMax-M3"
+
 
 class MythosTokenizer:
     """
