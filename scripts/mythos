@@ -1,0 +1,71 @@
+#!/bin/bash
+# mythos -- CLI for the local OpenMythos model (massive_best.pt).
+#   mythos <query>                 auto-detects T1003 / CVE-... / free text
+#   mythos <mode> <query...>       technique|sub|tool|malware|cve|actor|procedure|mitigation|capec|free
+#   mythos -i                      interactive session (loads the model in-process)
+#   mythos start | stop | status   background HTTP server (OpenAI + Ollama style API on 127.0.0.1:8830)
+#   mythos serve                   run the server in the foreground
+#   mythos mcp-config              print the commands that register the MCP server with each agent
+# With the server running, queries are instant; without it each query loads the 3 GB checkpoint.
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PY="$ROOT/.venv/bin/python"
+PORT=${MYTHOS_PORT:-8830}
+URL="http://127.0.0.1:$PORT"
+STATE="$HOME/.cache/openmythos"; PIDF="$STATE/server.pid"; LOG="$STATE/server.log"
+MODES=" technique sub tool malware cve actor procedure mitigation capec free "
+
+up() { curl -fs --max-time 2 "$URL/health" >/dev/null 2>&1; }
+pid_alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+
+case "${1:-help}" in
+  help|-h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  serve) exec "$PY" "$ROOT/scripts/mythos_server.py";;
+  start)
+    up && { echo "already running: $URL"; exit 0; }
+    mkdir -p "$STATE"
+    nohup "$PY" "$ROOT/scripts/mythos_server.py" >"$LOG" 2>&1 &
+    echo $! > "$PIDF"
+    echo "starting (pid $!), log: $LOG"
+    for _ in $(seq 1 90); do up && { echo "ready: $URL"; exit 0; }; pid_alive || { echo "server exited; see $LOG" >&2; tail -5 "$LOG" >&2; exit 1; }; sleep 2; done
+    echo "still loading after 3 min; check $LOG" >&2; exit 1;;
+  stop)
+    if pid_alive; then kill "$(cat "$PIDF")" && rm -f "$PIDF" && echo stopped; else echo "not running (no live pid file)"; fi; exit 0;;
+  status)
+    if up; then curl -s "$URL/health"; echo; else echo "not running"; fi; exit 0;;
+  -i|--interactive|chat) exec "$PY" "$ROOT/scripts/infer.py" --interactive;;
+  mcp-config)
+    cat <<EOF
+Start the server first:  mythos start
+MCP server command:      python3 $ROOT/scripts/mythos_mcp.py
+
+Claude Code:  claude mcp add openmythos -- python3 $ROOT/scripts/mythos_mcp.py
+Codex:        codex mcp add openmythos -- python3 $ROOT/scripts/mythos_mcp.py
+Gemini CLI:   gemini mcp add openmythos python3 $ROOT/scripts/mythos_mcp.py
+Copilot CLI:  add to ~/.copilot/mcp-config.json ->
+              {"mcpServers":{"openmythos":{"type":"local","command":"python3","args":["$ROOT/scripts/mythos_mcp.py"],"tools":["*"]}}}
+Goose/OpenCode: add a stdio extension/MCP entry with the same command.
+Ollama-style clients:  OLLAMA_HOST=127.0.0.1:$PORT   (model name: openmythos:massive)
+OpenAI-style clients:  base URL $URL/v1, any API key, model openmythos:massive
+EOF
+    exit 0;;
+esac
+
+# query: optional leading mode word
+mode=auto
+if [[ "$MODES" == *" $1 "* ]] && [ $# -gt 1 ]; then mode=$1; shift; fi
+q="$*"
+
+if up; then
+  body=$(python3 -c 'import json,sys;print(json.dumps({"mode":sys.argv[1],"query":sys.argv[2]}))' "$mode" "$q")
+  curl -fs --max-time 600 -H 'Content-Type: application/json' -d "$body" "$URL/query" \
+    | python3 -c 'import json,sys;r=json.load(sys.stdin);print(r["prompt"]+r["text"])'
+else
+  echo "(server not running: loading the model directly; use 'mythos start' for instant queries)" >&2
+  if [ "$mode" = auto ]; then
+    case "$(printf '%s' "$q" | tr a-z A-Z)" in
+      T1*.*) mode=sub;; T1*) mode=technique;; CVE-*) mode=cve;; *) mode=free;;
+    esac
+  fi
+  HF_HUB_OFFLINE=1 exec "$PY" "$ROOT/scripts/infer.py" --mode query --query-mode "$mode" --query "$q" --temp 0.3
+fi
