@@ -375,6 +375,321 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-01 · 定时胶水上线:RSS→标题文件 10 分钟自动刷新,Goinmax 新闻链全闭环
+
+**分支:** QuantKB + 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **glue 模式**:`rss_event_stream.py --headlines-out PATH`——拉 16 媒体源,
+  **24h 滚动时间窗全量重写**标题文件(一行一条、去重、过期自动淘汰)。
+  设计要点:窗口重写而非追加——旧 PAUSE 标题永久挡仓不可接受(事件实测 ~36h 衰减)
+- **TDD**:`parse_feed_dated`(RSS pubDate/Atom updated 解析,无日期保留 None)
+  + `write_headlines_file`(窗口过滤/重写幂等/去重),11 tests;
+  全套 **107 passed + ruff 零错**
+- **launchd `com.quantkb.rss-headlines`**:StartInterval=600s + RunAtLoad,
+  首跑实测 68 条标题落盘、词典命中 14(全为 Binance hack 残余 PAUSE,24h 窗内合规)
+- **部署指针定稿**:`RISK_OVERLAY_NEWS_FILE=~/Desktop/Claude/QuantKB/data/goinmax_headlines.txt`
+  ——Goinmax 部署侧至此只剩 `RISK_OVERLAY=1` 一个动作
+- 设计文档 §11 记录;已知边界再证(中文标题入档不命中,词典 v1 中文规则仍开放)
+
+### 📊 测试变化
+- QuantKB: 103 → **107 passed / 1 skipped**(+4 dated entries/headlines file)
+
+### 🔑 关键决策 / 发现
+- **时间窗语义是风控文件的核心设计**:文件的"全量重写"性质让新鲜度自动收敛,
+  与 Goinmax 侧"读到什么挡什么"的零逻辑形成干净分工——源侧管衰减,闸侧管裁决
+- 中文标题混入(68 条里约半数是中文源)再度量化了词典英文-only 的缺口
+- launchd StartInterval 是 macOS 上"每 N 分钟"的正确形态(cron 也行但 launchd
+  可 RunAtLoad + 日志重定向,运维面更干净)
+
+### 🧭 留到下阶段
+- 词典 v1 中文规则(中文标题占比 ~50%,当前完全漏判);laya 离线标注可开工
+- 部署侧:RISK_OVERLAY=1;用户决策项:上游 PR / Goinmax 远程推送
+
+## 2026-11-01 · Goinmax 风控叠加层接线完成(用户授权):事件守卫 + C2 硬闸进闸门管道
+
+**分支:** Goinmax `audit/backtest-next-bar-open` c01450296(本地未 push)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **接线(用户明确授权)**:`trader/risk_overlay.go` 独立模块 + `applyRiskGates` 一处
+  调用;`auto_trader_loop.go` **零改动**,删 2 文件+1 调用即拆。挂点 = 所有信号源决策
+  之后、执行之前的唯一闸门管道(与既有 5 道 gate 同管道合成)
+- **模块内容**:① O-event 词典 v0 Go 移植(全小写模式,SEC 大小写教训固化为回归
+  测试);② O-regime C2 硬闸(funding<0 ∧ toptrader_ls<1,fapi 公开接口 30min 缓存,
+  fail-open 不阻塞);③ O-vol 未接(O4 诊断定为可选件默认关)
+- **军械开关**:`RISK_OVERLAY=1` 才激活,未设置=休眠零行为改变(测试确定性 + 部署
+  零意外);`RISK_OVERLAY_NEWS_FILE` 指向 QuantKB RSS 标题输出(一行一条)
+- **17 项 Go 测试**:冻结 M3 原型集 15 条(含 SEC-sues 回归)、单向闸(只拒开新仓,
+  close/hold 过)、C2 真值表 4 例、数据缺失 fail-open、env 开关双向;go build 干净,
+  既有 TP12 系列 gate 测试不受影响
+- **依赖修复一处**:初版接线在测试中打真实网络(fapi)导致既有测试失败——改为
+  RISK_OVERLAY 显式激活后 fetch 才发生,测试恢复确定性(初版教训:热路径默认
+  拉网络 = 测试污染)
+
+### 📊 测试变化
+- Goinmax trader: 新增 17(overlay 全绿);遗留 TestClassifyRegimeLevel 分支预存失败
+  (market/regime.go 2026-08-27 动量维度改动未同步测试期望)——按外科原则记录不动
+
+### 🔑 关键决策 / 发现
+- **安全默认值方向**:风控件默认休眠(而非默认激活)——激活是部署动作不是编译动作,
+  与"防误伤"的代价矩阵一致;QuantKB 侧 1509 天数据验证 + Goinmax 侧真事件验证
+  已给足启用依据,但扳机留给部署者
+- 风控叠加层至此落地:事件守卫(真事件实战)+ C2 硬闸(v1 唯一 PASS 形态主体)
+  进入 Goinmax 生产代码路径,等待部署配置 RISK_OVERLAY=1 生效
+
+### 🧭 留到下阶段
+- 部署侧:设置 RISK_OVERLAY=1 + RISK_OVERLAY_NEWS_FILE(QuantKB RSS 管道定时写入)
+- 遗留项:TestClassifyRegimeLevel 修复(独立);词典 v1 中文规则;laya 离线标注;
+  上游 PR / Goinmax 远程推送均待用户决策
+
+## 2026-11-01 · 风控叠加层 v1 重判(用户口径决策):C1×O3 唯一 PASS,O4 诊断定接线件
+
+**分支:** QuantKB(risk_overlay)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **用户产品决策落地**:v1 验收 = OOS≥0 且 MDD↓≥20%,撤销收益保留下限
+  (风控层职责=用收益换回撤);v0 研究判决(FAIL)在研究记录中不变——
+  产品验收与研究验收分账,不互相污染
+- **v1 重判:1/6 PASS — C1×O3 唯一通过**(OOS +0.88%、MDD 6.23%↓35%、全史 +6.32%)
+- **O4 分解诊断(纯硬闸不带 vol-target)**:OOS **+5.06%**(全场最高)、保留 85%、
+  MDD↓19%(距线 1pp)→ **硬闸拿走几乎全部风险收益;vol-target 边际代价
+  OOS −4.2pp/保留 −58pp 只换 MDD↓+16pp,降级为可选件默认关**
+- **接线规格修订**(设计 §8):O-event + O-regime 硬闸必接;O-vol 可选;
+  数据面 fapi funding + Vision toptrader_ls(无 key,1509 天已验证)——
+  代码实施仍等用户明确授权
+- 测试 +1(O4 语义):全套 **103 passed**
+
+### 📊 测试变化
+- QuantKB: 102 → **103 passed / 1 skipped**(+1 DIAGNOSTIC_VARIANT 语义)
+
+### 🔑 关键决策 / 发现
+- **研究验收 vs 产品验收分账**是本项目纪律的自然延伸:v0 FAIL 是事实、v1 PASS 也是
+  事实,两者口径不同、同时成立;记录里写清哪条是哪个口径,不改写历史
+- O4 分解又一次证明"简单件拿走主要收益":regime 硬闸(2 个条件的 AND)是核心,
+  连续缩放件(vol-target)是昂贵加购——与"信号作特征、复杂映射不变现"同构
+
+### 🧭 留到下阶段
+- **Goinmax 风控前置接线**(O-event+硬闸,等用户明确授权;不动 auto_trader_loop)
+- 词典 v1 中文规则;laya 离线标注;上游 PR 用户决策项
+
+## 2026-11-01 · 风控叠加层 v0 量化:O2 预注册 FAIL,O3×C1 全场最佳风险画像(待验收口径决策)
+
+**分支:** QuantKB(risk_overlay + risk_overlay_gate)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **预注册**(docs/risk_overlay_design.md):O-vol 波动率目标仓位 + O-regime C2 乘子
+  (软 0.5/硬 0)+ O-event(live-only 不模拟);参数全部 IS 冻结零搜索
+  (target_vol=IS 中位数 36.76%);验收 = OOS MDD↓≥20% 且全史收益保留 ≥50%
+- **TDD**:`quantkb/risk_overlay.py` 8 tests(vol 缩放因果/乘子滞后 t+1/无未来函数)
+- **4.1y 终跑:O2 主变体 0/2 FAIL**。失败机理:vol-target(IS 中位数目标)过度砍仓
+  (收益保留仅 1-27%),且 O1 对 B&H 的 OOS MDD 反而恶化(高波砍仓错过恢复)
+- **信息层(不改判)**:O3×C1(硬闸)OOS **+0.88%(全 campaign 唯一正 OOS)**、
+  MDD 6.23%(↓35%)、全史 +6.32%——最好风险画像,但保留率 27%<50% 不过成本界
+- **Goinmax 接线规格**(设计 §6,仅规格未动代码):只接 O-event + O-regime 硬闸,
+  O-vol 需先单独验证收益代价
+
+### 📊 测试变化
+- QuantKB: 94 → **102 passed / 1 skipped**(+8 risk_overlay)
+
+### 🔑 关键决策 / 发现
+- **"收益保留≥50%" 成本界 vs 风控产品职责的冲突暴露**:风控层本来就是用收益换回撤,
+  保留率界是 alpha 思维——**验收口径是否重订("OOS 转正+MDD↓≥20% 不设保留下限")
+  是用户决策点,本轮不追认不改判**(预注册纪律)
+- vol-target 在趋势性 BTC 上不是免费午餐:O1 单独使用对 B&H 的 OOS MDD −7% 恶化
+- 纪律自证:O3×C1 数字全场最好,但按预注册判 FAIL——第 3 次"好看的数字不改判"
+
+### 🧭 留到下阶段
+- **用户决策:风控叠加层 v1 验收口径**(降回撤优先 vs 保留率下限)
+- 接线(Goinmax 风控前置,等明确授权);词典 v1 中文规则;laya 离线标注;上游 PR
+
+## 2026-11-01 · ③ 条件变量族判负:alpha 路线终局收束,三次实验链完成
+
+**分支:** QuantKB(regime_conditions + conditional_regime_gate)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **预注册**(docs/conditional_regime_design.md):价格基线冻结(② 的 V1 原样)+
+  条件变量族(funding<0 / 大户多空比<1 / ΔOI_24h<0);C1 主变体 + C2-C4 敏感性,
+  5 变体全报告不选择;验收与 ② 同构(G1 IR≥1.20/MDD≤10%/交易≤200 + G2)
+- **数据**:Binance Vision daily metrics **1509 天零缺失**(434,459 行 5m:
+  OI/大户账户比/taker 买卖量比),与 4.1y 面板同起点;funding 复用已拉的 4,522 条
+- **TDD**:`quantkb/regime_conditions.py` 7 tests(因果对齐:扰动未来数据不影响过去
+  条件;5m→1h as-of 对齐取 ≤ bar 最后一行)
+- **终跑:0/5 过 G1**。IR 全部 −0.27~−0.01(距 1.20 两个数量级);C2 交易 18 笔
+  OOS −1.18%(跑赢 B&H 6.8pp)/MDD 5.09% 是全场最好风险画像,但 IR −0.01 不过线
+- **预注册终判规则触发:③ 判负,alpha 路线整体收束**(①②③ 三链全灭)
+
+### 📊 测试变化
+- QuantKB: 87 → **94 passed / 1 skipped**(+7 regime_conditions)
+
+### 🔑 关键决策 / 发现
+- **条件变量改善的是风控指标不是 alpha**:MDD 23%→5%、OOS 少亏最多 9pp,但超额≈0
+  ——"市场状态数据救不了价格信号的 alpha,只能救它的风控"
+- **C2(funding<0 ∧ 大户净空)转入风控叠加层候选**作降仓信号(验收=降回撤);
+  oi_delever 反效果已记录(OI 下降与下跌同步,门控接落刀)
+- 纪律自证:5 变体全报告、C2 好看但不改判——预注册规则写死"无一过 G1 即判负"
+
+### 🧭 留到下阶段
+- 风控叠加层落地:C2 降仓信号 + 事件守卫 + ATR 仓位 → Goinmax(等用户授权接线)
+- 词典 v1 中文规则;laya 离线标注;用户决策项:上游 PR
+
+## 2026-11-01 · Binance hack 实战冲击对照:PAUSE 先于峰值 21h,shock 阈值校准修正
+
+**分支:** QuantKB + 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **首次真事件校验**($6.3B Binance hack,Cointelegraph 首发 10-29 21:24 UTC):
+  fapi 拉事件窗 240 bars × 4.1y 基线,24h ret 峰值 **−5.21%**(10-30 18:00 窗),
+  峰谷跌幅 −3.01%(78,997→76,615),~36h 衰减转正
+- **守卫时间线验证(核心)**:首发标题即 PAUSE(severity 2),**先于最大冲击窗口 21 小时**;
+  "PAUSE=技术信号让位"若已接线可躲过 −5.2% 段,代价错过尾段 +0.8% 反弹——
+  设计的不对称代价矩阵首次实战走通
+- **shock 阈值校准修正**:原 2.88%(736-bar/30 天校准)不稳定,**4.1y 重算 =
+  5.07%**(1808/36153);本事件按新阈值恰越线、按旧阈值会大半时段误报。
+  `shock_calibration_btc.md` 已标注 2.88% 作废
+- 事件类型判读:"新闻巨大、价格中等"型(头条级事件 vs −3% 价格)——守卫语义保守正确,
+  纯价格确认会漏;单事件不外推
+
+### 📊 测试变化
+- 无代码变更(纯数据验证);QuantKB 87 passed 不变
+
+### 🔑 关键决策 / 发现
+- **短窗校准是陷阱的又一实例**:30 天 95 分位 2.88% vs 4.1y 5.07%——与 30 天因子假信号、
+  短窗 IC 夸大同构,校准类工作必须用最长可用历史
+- 守卫"PAUSE 状态保持至事件衰减"的语义与真实事件衰减节奏(~36h)匹配良好
+
+### 🧭 留到下阶段
+- 词典 v1 中文规则;RSS 流 → Goinmax 风控前置接线(等用户授权);laya 离线标注语料
+- 用户决策项:上游 PR
+
+## 2026-11-01 · M3 新闻接线打通:RSS 事件流实测,Binance hack 实战命中
+
+**分支:** QuantKB(news_stream 工具集)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **接线开工前置破解**:Chainfeeds OPML(600+ Web3 RSS 源,2.1k★)替代 CryptoPanic
+  token 成为新闻源——媒体类 16 源(CoinDesk/Cointelegraph/Decrypt/Blockworks 等)无需 key
+- **TDD**:`quantkb/news_stream.py`(RSS 2.0/Atom 解析、OPML 媒体类抽取、词典管道、
+  命中统计;纯 stdlib)+ 7 tests;`tools/rss_event_stream.py` 拉真实源
+- **真实流实测**(8 源快扫):155 条标题,PAUSE 29 / REDUCE 1 / NORMAL 125,命中率 19.4%
+- **实战验证(意外收获)**:恰逢 $6.3B Binance hack 刷屏,29 条 PAUSE 全部正确捕获
+  (FBI 定性/提币暂停/股价联动)——"PAUSE=冲击市况"语义首次真事件实战;同事件多标题
+  连续触发由 PAUSE 状态保持天然幂等
+- **边界发现**:词典英文-only——中文语义标题("某交易所遭黑客攻击 提币暂停")判 NORMAL,
+  BlockTempo 中文源命中 0 部分源于此;升级路径标注语料须含中文或词典补中文规则
+- 管道健壮性:1 源 502 per-feed 隔离不阻塞
+
+### 📊 测试变化
+- QuantKB: 80 → **87 passed / 1 skipped**(+7 news_stream)
+
+### 🔑 关键决策 / 发现
+- **M3 开工条件从"等 token"变成"已完成首段"**:RSS→词典→档位管道全程无 key、
+  无外部服务依赖;CryptoPanic 降级为可选(只剩历史回填价值)
+- 大事件期 PAUSE 会连环命中同源标题——守卫语义(PAUSE 状态保持)天然去重,
+  事件流接入 Goinmax 时无需额外事件聚类
+- 中文标题漏判是语料盲区而非实现 bug;Goinmax 主要交易 BTC/USDT 但中文社媒信号
+  有信息量,词典 v1 值得加中文规则(~20 条)
+
+### 🧭 留到下阶段
+- 词典 v1 中文规则;RSS 流接 Goinmax 风控前置(用户授权后,不动 auto_trader_loop);
+  存量标题 + laya 离线标注 → 微调分类器语料
+- 用户决策项:上游 PR(新闻 token 已非阻塞)
+
+## 2026-11-01 · laya A/B:词典 v0 保持主力,抓出并修复 regulator_lawsuit 静默失效
+
+**分支:** QuantKB(laya_event_guard_ab 工具)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **laya 环境**:QuantKB `.venv`(homebrew python3.12 + torch 2.15 + laya 0.4.x);
+  排障记:`/usr/local/bin/python3.12` 的 pip 索引钉在旧镜像(torch ≤2.2.2 与
+  transformers ≥2.6 冲突),换 homebrew python3.12 即解
+- **A/B 实测**(`tools/laya_event_guard_ab.py`,M3 原型集 15 条冻结):词典 93% vs
+  laya 67%;中性误触 0 vs 0;laya ~30s/条(CPU,远低于宣传 33ms GPU 口径)
+- **意外收获——词典真 bug**:laya 答对了词典答错的 "SEC sues…"——
+  `regulator_lawsuit` 规则大写 `(?:SEC|CFTC)` 与 `assess()` 的 lower() 匹配冲突,
+  **自 M3 上线从未生效**。修复 + `test_regression_sec_sues_pause` 钉死(修复后词典 15/15)
+- laya 判错模式:depeg→NORMAL、bankruptcy/halt→降档、ETF→过度 PAUSE、FOMC→漏档;
+  checkpoint 温度校准无效警告
+
+### 📊 测试变化
+- QuantKB: 79 → **80 passed / 1 skipped**(+1 regulator_lawsuit 回归)
+
+### 🔑 关键决策 / 发现
+- **词典 v0 保持事件守卫主力**:原型集上 laya 替代不了(67% vs 100%),实时性也不够;
+  laya 定位修正为词典 miss 时的二次语义判官/离线评估 judge,不进守卫热路径
+- lower() 后匹配的词典规则必须全小写——类 bug 在 M3 词典其他规则复核过无第二例
+- A/B 对照即使"被测方"失败也有产出:对照暴露了主系统的静默失效,回归钉死后闭环
+
+### 🧭 留到下阶段
+- 事件守卫接新闻源(CryptoPanic token)后可用 laya 做离线标注加速;上游 PR 用户决策项不变
+
+## 2026-10-31 · ②路线实验:极端偏离低换手均值回归判负,V4 资金费门控指向③
+
+**分支:** QuantKB(extreme_reversion 工具集)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **预注册设计**(docs/extreme_reversion_design.md):48h range_position 深度偏离 +
+  vol5/vol60 门控 + raw 回归出场;4 变体(V1 主 + V2/V3/V4 敏感性)全报告不选择;
+  验收 = 交易≤200/4.1y + OOS IR≥1.20 + MDD≤10% + G2 三窗/±10%
+- **修正记录**(真实数据之前):合成机制测试抓出两设计缺陷——z-exit 先于价格回归
+  (oracle 亏 3%)、vol20 基线漏过崩溃 → 改 raw 进出 + vol60;机制门先于真实数据的正确用法
+- **TDD**:`quantkb/extreme_reversion.py` + 11 tests(oracle 盈利/无未来函数/t+1 滞后/
+  资金费门控/崩溃核心不开仓);全套 79 passed
+- **真实数据终跑**(BTC 1h 36,177 bars,funding 4,522 条覆盖 99.997%):
+  **G1 全灭**——V1 402 笔超预算 2 倍(事件化降换手在纯价格信号上失效)、IR 全负
+- **V4 唯一正信息(非选择)**:资金费门控交易 402→84、全史 +23.80%、OOS −3.81%
+  (跑赢 B&H 4.2pp)、MDD 9.52% 达标;IR −0.07 仍差 1.20 两个数量级
+
+### 📊 测试变化
+- QuantKB: 68 → **79 passed / 1 skipped**(+11 extreme_reversion)
+
+### 🔑 关键决策 / 发现
+- **"让第二大脑因子正收益"的答案定案:①调参(已证伪)②事件条件化(本实验判负)→
+  只剩 ③ 新数据源条件变量**;V4 的资金费门控是全实验唯一增量,方向指向 funding/OI/多空比
+- 事件化不是万能降换手:raw 偏离频繁反复触发,纯价格信号上事件预算都守不住
+- 机制门(合成 oracle)先于真实数据运行,抓出 2 个设计缺陷——与"先看 OOS 再改口径"
+  的反面案例(M4b)形成对照,预注册纪律再次自证
+
+### 🧭 留到下阶段
+- ③ 路线:funding/持仓量/多空比作为条件变量族系统验证(同一预注册协议)——唯一活路
+- 风控叠加层(ATR 仓位/事件守卫)落地仍是今天可交付的正确定位
+- 用户决策项:上游 PR / 新闻 token
+
+## 2026-10-30 · 第二大脑 V3 top-12 因子验证:4.1y OOS 0/9,声明口径三处硬伤
+
+**分支:** QuantKB(v3_factor_gate 工具集)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **Gate 0 声明审计(全实锤)**:①horizon 24× 误标——"1天/…/30天"实为 1h bar 的
+  1/5/10/20/30 小时(`effective_factors_v3.csv` 的 data_points 584-635 = 636 根 − 预热,
+  27 天窗口不可能算 30 天 horizon);②`ml_gb_future_volatility_10_bb_lower_20` =
+  `bb_lower_20 × 重要性常数`(`ml_mining.py:410-423`)——绝对价格水平伪回归,非 ML 预测;
+  ③笔记公式 `(ma_5−ma_50)` vs 代码 `(ma_25−ma_50)` 不符
+- **TDD 移植**:`quantkb/v3_factors.py` 8 个闭式因子 + bb_lower_20 等价替身,11 tests
+  手算 fixture 钉死(ATR NaN 传播语义一并固化)
+- **声明复现**:best-effort(atr_10 RMSE 0.0096 / bb_lower 0.0207 最佳)——量级方向可复,
+  精确值不可复(切片与收益口径未留档);"IC_30=−0.3556"正确读法 = 30 **小时** IC
+- **4.1y Gate 1/2**(IS 冻结 + 中位数阈值映射 + 10bp/3bp,去自相关 ICIR 非重叠 168-bar):
+  **0/9 过 Gate 1**,7/9 过 G2(volume_volatility 两只分段变号)。ICIR 三只过子门
+  (bb_lower +1.221 / ma_cross +0.669 / pvc +0.573)但 AR/IR 全灭——IC ≠ PnL 第 6-8 次
+- **PCA 三因子不可复现**:`pca_component_5/9` pkl 是 PCA 对象却调 `predict()` 崩溃;
+  `pca_component_3` 特征列与训练 19 列错位→填 0 出垃圾。静默失败温床(print+空 Series)
+- 工具:`tools/v3_factor_gate.py` / `tools/dump_v3_pca_factors.py` + docs/v3_factor_gate.md
+
+### 📊 测试变化
+- QuantKB: 57 → **68 passed / 1 skipped**(+11 v3_factors)
+
+### 🔑 关键决策 / 发现
+- **先审声明、再验数字**:data_points 列是反推评估设计的化石证据,复算之前就抓出 24× 误标;
+  第二大脑的交易建议("组合 A/B/C 权重""2-4 周持仓")建立在误标 + 27 天过拟合上,已作废
+- 映射教训第二组因子族再证:volatility 族恒正值,符号映射退化为永远满仓(首轮 4 行收益
+  完全相同 −7.85%);正值因子必须阈值语义(IS 中位数,冻结零调参)
+- 慢因子 ICIR 大 ≠ 可交易(bb_lower 1.22 照样 FAIL,价格水平 IC 是伪回归)——
+  [[ic-icir-autocorrelation-sampling]] 的警告在本轮双重兑现
+
+### 🧭 留到下阶段
+- 第二大脑 MOC/相关笔记补终判链接;V1/V2 榜单若引用需同样降级
+- 用户决策项:上游 PR / 新闻 token
+
 ## 2026-10-30 · D 路线横截面判负 + ICIR 自相关夸大发现,因子族收束
 
 **分支:** QuantKB(c650ff7)+ 本条目 · **Agents:** 无
