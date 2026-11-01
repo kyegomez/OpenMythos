@@ -375,6 +375,35 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-01 · 上游 PR #91 提交;Goinmax 推送经用户决策暂缓(密钥安全)
+
+**分支:** OpenMythos `codex/sync-main-with-origin-20260524`(fork 已推至 77069c5)· **Agents:** 无
+
+### ✅ 完成
+- **上游 PR 合入启动**:kyegomez/OpenMythos **PR #91** 已创建
+  (https://github.com/kyegomez/OpenMythos/pull/91)——96 commits,按阶段 ID
+  (P0-P5/Q1-Q2/small-LM)组织描述,310 tests / 97% 覆盖 / mypy 全绿 / CI 三闸
+  进 PR 说明;merge 由上游维护者裁决
+- **Goinmax 远程推送:用户决策暂缓**。勘察发现:①仓库无任何远程配置;
+  ②git 追踪真实生产密钥(.env.production / nginx/key.key 私钥 / API key 文档)
+  ——推 GitHub(即使私有仓)等于密钥交第三方托管且历史不可清洗。选项
+  (原样推/剥离历史/只推头/暂不推)呈报后用户选**暂不推**,本地保留
+- fork 推送:CLAUDE.md/CLAUDE.md 日志提交 77069c5 已推 Goinbit/OpenMythos
+
+### 📊 测试变化
+- 无代码变更(纯流程操作)
+
+### 🔑 关键决策 / 发现
+- **密钥入库是 Goinmax 的结构性债务**:.gitignore 只挡 .env/.env.*.local,
+  .env.production 与 nginx 私钥是被显式追踪的——若未来要开源/托管,
+  git filter-repo 剥离历史是前置条件(已列为选项记录在案)
+- 外发动作(上游 PR)与敏感动作(带钥推送)分开处置:前者直接执行,
+  后者先勘察再呈报——勘察价值在于发现"用户授权时未必知道密钥在历史里"
+
+### 🧭 留到下阶段
+- PR #91 等上游裁决;Goinmax 推送待密钥剥离方案启动后再议(选项已留档)
+- 词典 v1 中文规则;laya 离线标注;部署侧 RISK_OVERLAY=1
+
 ## 2026-11-01 · 定时胶水上线:RSS→标题文件 10 分钟自动刷新,Goinmax 新闻链全闭环
 
 **分支:** QuantKB + 本条目 · **Agents:** 无
