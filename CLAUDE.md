@@ -375,6 +375,40 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-02 · Goinmax 密钥剥离完成(隔离镜像,原仓零改动)
+
+**分支:** `~/Desktop/Claude/Goinmax-clean.git`(隔离镜像,未推送)· **Agents:** 无
+
+### ✅ 完成
+- **用户指令**:在此剥离 Goinmax 密钥,本对话**不许动 Goinmax 原仓**——处置:
+  唯一涉原仓操作为 `git clone --mirror file://`(只读,零修改);全部剥离作业
+  在隔离目录 `Goinmax-clean.git` 进行
+- **git filter-repo 全历史剔除 4 个敏感文件**:`.env.production` /
+  `nginx/key.key`(TLS 私钥)/ `config/profiles/minimal_viable_trader.env` /
+  `docs/MARKET_INTEL_API_KEYS.md`
+- **三重验证**:①4 文件全历史 0 提交;②全 refs 文件名扫描仅剩
+  `profit-runtime.env.example`(惯例模板,无密);③内容扫描(私钥头/API key
+  赋值模式)未见内嵌密钥——干净镜像可托管
+- 镜像保留 **253 refs**(全部分支/标签,含 risk-overlay 与中文词典分支
+  `audit/risk-overlay-zh` 6ea2f723e)——剥离后这些工作成果齐备,待推送
+- filter-repo 首跑拒绝(--force 前):镜像复制了源仓的 stash ref,属已知无害
+
+### 📊 测试变化
+- 无代码变更(纯历史手术)
+
+### 🔑 关键决策 / 发现
+- **"剥离"与"推送"分离**:剥离已完成且验证干净,但推送是外发动作——按此前
+  "密钥剥离后再议推送"的约定,**推送等用户一句话**(目标建议:Goinbit 私有仓)
+- 原仓历史仍含明文密钥(剥离只动镜像)——原仓若将来要托管,同一 filter-repo
+  处方可在原仓执行,但那会改写原仓历史(重写 commit 哈希),须用户显式授权
+- 遗留:上一轮的 `git worktree`(Goinmax-zh-lexicon)注册在原仓 .git 中,
+  在"不动 Goinmax"指令前产生;移除它需写原仓,故留待用户裁决
+
+### 🧭 留到下阶段
+- **用户决策:推送干净镜像**(253 refs)到 Goinbit 私有仓与否
+- 回滚实验收束后 risk-overlay(含中文词典)并回主干;A2 协方差熵;laya 离线标注;
+  PR #91 上游裁决
+
 ## 2026-11-02 · 词典 v1 中文规则双侧落地;Goinmax 回滚实验发现(risk-overlay 幸存 backup)
 
 **分支:** QuantKB + Goinmax `audit/risk-overlay-zh`(6ea2f723e,worktree 提交)· **Agents:** 无
