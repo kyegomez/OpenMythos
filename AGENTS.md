@@ -375,6 +375,35 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-02 · A1 固化:数据噪声稳健性入 Gate 0.5(AlphaEval 合流落地)
+
+**分支:** QuantKB(noise_robustness)+ 本条目 · **Agents:** 无
+
+### ✅ 完成
+- **`quantkb/noise_robustness.py`**:`check_noise_robustness(compute_fn, df, horizon)`
+  ——对 OHLCV 乘性扰动(高斯 σ=0.001 + t3 厚尾,AlphaEval noise_proc 口径)重算
+  因子 IC;`robust_verdict` 纯判定(预注册阈值:符号不变且偏移 <0.05)
+- **TDD 7 tests**(判定四态/种子确定性/扰动确实改数据/稳定因子通过);全套
+  **114 passed + ruff 零错**
+- **固化中发现尺度语义**(值得沉淀):合成数据收益 std 0.004 时,σ=0.001 噪声占
+  信号 25%,AR(1) 动量 IC 被真实降解(0.39→0.29,shift 0.10 超限正确 FAIL)——
+  改用真实 BTC 量级(≈0.01)后通过。**噪声稳健性判定是噪声/信号尺度比的函数;
+  AlphaEval 的 σ=0.001 隐含对标日线/小时线收益尺度,低波动品种需按比例缩放噪声**
+- 合流笔记 A1 状态更新为"已固化",补固化记录段
+
+### 📊 测试变化
+- QuantKB: 107 → **114 passed / 1 skipped**(+7 noise_robustness)
+
+### 🔑 关键决策 / 发现
+- Gate 0.5 与 Gate 0 的分工落定:Gate 0 查机械正确性(未来函数/费用/数据完整性),
+  Gate 0.5 查**计算稳健性**(数据噪声不翻);二者都不证明 alpha——有效性只归 OOS
+- 测试夹具的"信号尺度"必须对标目标市场的真实波动,否则鲁棒性检验本身失真——
+  这与"30 天窗口校准陷阱"同构:**校准物要匹配使用域**
+
+### 🧭 留到下阶段
+- A2 协方差熵(组合装配时再做);A3 财务逻辑 LLM 分仅 triage 的约束已写死
+- 词典 v1 中文规则;laya 离线标注;PR #91 裁决;Goinmax 密钥剥离后再议推送
+
 ## 2026-11-02 · AlphaEval × QuantKB 方法论合流:五维对照 + 噪声稳健性 spike
 
 **分支:** 本条目(Obsidian 方法论)· **Agents:** 无
