@@ -375,6 +375,40 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-02 · 词典 v1 中文规则双侧落地;Goinmax 回滚实验发现(risk-overlay 幸存 backup)
+
+**分支:** QuantKB + Goinmax `audit/risk-overlay-zh`(6ea2f723e,worktree 提交)· **Agents:** 无
+
+### ✅ 完成
+- **词典 v1 中文规则 16 条**(PAUSE×7/REDUCE×9,简繁双形),Python `event_guard.py`
+  + Goinmax Go `risk_overlay.go` 逐条同步;冻结中文原型集 18 条(含繁体回归/中性
+  不误触),Python 10/10 + Go 原型集绿;全套 QuantKB **116 passed**
+- **真实语料复验**(launchd 实时档 90 条):中文命中 0→1、英文 9 保持;中文命中为
+  "禁止"误触非加密新闻(可接受误放,代价矩阵方向正确),如实记录
+- **⚠️ Goinmax 回滚实验发现**:主工作树 `audit/backtest-next-bar-open` 被
+  **reset 到 rollback-2026-09-30-e3-plus-lagfix + cherry-pick entry-ban**
+  (reflog HEAD@{1},另一会话/流程操作,10 次回滚胜率对比实验)——昨天的
+  risk-overlay 提交 c01450296 被卷出主干,但**幸存于 `backup/pre-e3-rollback-2026-11-02`
+  分支**(已验证 ancestor)。处置:不动主工作树(尊重回滚实验),用
+  **git worktree** 从 c01450296 重建 `audit/risk-overlay-zh` 分支,中文规则提交其上
+- Goinmax 测试遗留 TestClassifyRegimeLevel 仍红(预存,非本次);gofmt 本次文件干净
+
+### 📊 测试变化
+- QuantKB: 114 → **116 passed / 1 skipped**(+2 中文原型/中性)
+- Goinmax(risk-overlay-zh 分支): TestEvent 系全绿
+
+### 🔑 关键决策 / 发现
+- **跨会话冲突的正确处置**:主工作树被其他流程回滚时,先 reflog 验证我方工作去向、
+  用 worktree/独立分支保护成果,**不与回滚实验对抗**——回滚有 backup 仪式感
+  (backup/pre-e3-rollback-*),是受控操作而非事故
+- 文本词典无主题过滤:"禁止"类规则会误触非加密新闻——按代价矩阵可接受,但
+  若误挡成本上升,可加 crypto 语境限定(留档不做)
+- worktree 是"主树在做实验、我又要在同仓库落盘"场景的标准解法,零干扰
+
+### 🧭 留到下阶段
+- risk-overlay(含中文词典)等回滚实验收束后并回主干(用户裁决时机)
+- A2 协方差熵;laya 离线标注;PR #91 裁决;Goinmax 密钥剥离后再议推送
+
 ## 2026-11-02 · A1 固化:数据噪声稳健性入 Gate 0.5(AlphaEval 合流落地)
 
 **分支:** QuantKB(noise_robustness)+ 本条目 · **Agents:** 无
