@@ -375,6 +375,38 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-02 · GitHub 因子论文/算法采集入库第二大脑(30+ 仓库 / 7 篇论文)
+
+**分支:** 本条目(Obsidian 采集)· **Agents:** 无
+
+### ✅ 完成
+- **GitHub 六方向采集**:经典公式库(alpha101/191/KunQuant 619 因子清单)、
+  挖掘算法(QuantaAlpha 1.6k★/alphagen KDD23/AlphaForge AAAI25/AlphaEval/
+  AlphaSAGE GFlowNet/Alpha² 等 12+,7 篇论文带 arXiv/会议出处)、评估方法论
+  (AlphaEval arXiv:2508.13174,最高优先)、神经网络因子(AlphaNet 系)、
+  crypto 特化(crypto 永续因子流水线/L2 订单簿 imbalance)、平台/论文库
+- **入库**:`20-Knowledge/github-factor-papers-algorithms.md`(type: reference)
+  ——顶部加"使用边界"警示(引用 [[alpha-line-closure-verdict]]):索引是论文/算法
+  参考资产而非 alpha 信号源,价值排序 = 评估方法论 > 非价格数据因子 > 经典库作特征 >
+  挖掘算法作工具
+- **双链**:FactorMiner MOC 挂"外部学术资产"条目;笔记内链 6 条
+  (alpha-line-closure/ic-icir-checklist/V3 verdict 等)
+
+### 📊 测试变化
+- 无代码变更(纯资料采集)
+
+### 🔑 关键决策 / 发现
+- **行业侧印证我方经验**:挖掘算法 12+ 个爆发、严格评估框架仅 AlphaEval 1 个——
+  "瓶颈在验证不在生成"与 8 次 IC≠PnL 互证;LLM 挖掘最热(QuantaAlpha)但我方
+  LLM 因子实验已判负,引用前须过 Gate 1/2
+- 2025-26 趋势:GFlowNet 替代 GA/RL 做公式搜索(鲁棒探索),恰针对 IS 过拟合坑;
+  组合优于单因子已是共识(alphagen 协同集合/AlphaForge 动态组合)
+- crypto 订单簿 imbalance 仓库是非价格数据路线(③)的现成参考
+
+### 🧭 留到下阶段
+- 可选:AlphaEval 评估维度与 QuantKB Gate 0-2 对照互验(方法论合流)
+- 词典 v1 中文规则;laya 离线标注;PR #91 等裁决;Goinmax 推送待密钥剥离
+
 ## 2026-11-01 · 上游 PR #91 提交;Goinmax 推送经用户决策暂缓(密钥安全)
 
 **分支:** OpenMythos `codex/sync-main-with-origin-20260524`(fork 已推至 77069c5)· **Agents:** 无
