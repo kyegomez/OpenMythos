@@ -375,6 +375,39 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-02 · AlphaEval × QuantKB 方法论合流:五维对照 + 噪声稳健性 spike
+
+**分支:** 本条目(Obsidian 方法论)· **Agents:** 无
+
+### ✅ 完成
+- **AlphaEval 五维度代码级提取**(dhj74/AlphaEval,arXiv:2508.13174, KDD 2026):
+  ①预测力(IC/Rank IC 截面)②稳定性(时序)③**数据噪声稳健性**(noise_proc.py:
+  乘性高斯 var0.001 + t3 厚尾扰动)④**财务逻辑**(LLM_scores)⑤**多样性**
+  (协方差熵);modeltester 含 0.15% 费用
+- **双向对照表**:它独有 = 噪声稳健性/财务逻辑/多样性;我方独有 = IS/OOS 冻结、
+  去自相关 ICIR、未来函数执法、真金级验收;定位判定:**AlphaEval 是筛选器,
+  QuantKB 是法庭**——5 维初筛 → Gate 0-2 终判
+- **互验 spike(真实数据)**:噪声维度施加到 V3 因子(4.1y BTC 1h,重建面板
+  36,211 bars——/tmp 旧面板被系统清理,fapi 重拉),5/5 符号稳定 OK,
+  **但它们的 OOS 早已判负 → 该维度只证"计算不脆弱",不证"alpha 有效"**
+- **合流决议**:A1 噪声稳健性→Gate 0.5(spike 已验证可固化)/A2 协方差熵→组合装配前
+  /A3 财务逻辑 LLM 分→仅 triage 永不 gate;反哺 B1-B3(去自相关采样/OOS 冻结/
+  IC≠PnL)是引用任何免回测框架结论时的必打补丁
+- 入库 `alphaeval-quantkb-methodology-convergence.md`(type: pattern)+ 采集索引内链
+
+### 📊 测试变化
+- 无代码变更(spike 为一次性验证脚本);A1 固化为测试留待下轮
+
+### 🔑 关键决策 / 发现
+- **噪声稳健性是 Gate 0 补件不是通行证**:5 个 OOS 判负因子全部通过噪声检验——
+  "计算稳健"与"可交易"是两个正交轴,免回测框架的强项恰好在前者
+- 行业论文(KDD 2026)与我方 8 次 IC≠PnL 的互补性比竞争性强:它做规模化初筛,
+  我们做终判;正确姿势是流水线串联而非二选一
+
+### 🧭 留到下阶段
+- A1 固化为 Gate 0.5 测试(半小时);A2 协方差熵工具(组合装配时再做)
+- 词典 v1 中文规则;laya 离线标注;PR #91 裁决;Goinmax 密钥剥离后再议推送
+
 ## 2026-11-02 · GitHub 因子论文/算法采集入库第二大脑(30+ 仓库 / 7 篇论文)
 
 **分支:** 本条目(Obsidian 采集)· **Agents:** 无
