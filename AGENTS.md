@@ -375,6 +375,37 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-07 · 七篇因子论文深度研读入库(4 篇全文级)
+
+**分支:** 本条目(Obsidian 深读)· **Agents:** 无 · **约束:全程零 Goinmax 操作** ✅
+
+### ✅ 完成
+- **抓取**:alphagen(ar5iv 全文)/AlphaForge(arXiv html 全文)/AlphaSAGE(html 全文)/
+  AlphaEval(html 全文)拿到方法公式与关键数字;101 Alphas/Alpha²/QuantaAlpha 摘要级
+- **入库** `factor-papers-deep-study.md`:逐篇(方法/关键数字/评估协议/对我方意义)+
+  六方向综合 + 五条硬结论;采集索引与合流笔记补双链与公式补遗
+- **关键数字落袋**:alphagen CSI300 IC 0.0725(池协同 PPO);AlphaForge CSI300 4.40%
+  + **真金 300 万 RMB 9 个月超额 +21.68%**(七篇唯一);AlphaSAGE IC 0.079/SR 1.71
+  (GFlowNet+RGCN,消融证明图编码是最大单项);AlphaEval 五维公式全录
+  (PFS≥0.9↔低MaxDD p=0.0001;RRE↔低换手 R²=0.815)
+
+### 🔑 关键决策 / 发现(五条硬结论)
+1. **域空白**:七篇全在 A股/美股截面日线;crypto 永续 1h 单标的零学术基准——
+   方法论可移植但须全量适配,且其 IC 量级(0.04-0.08)与我方实测(0.01-0.05)意外一致
+2. **单因子验收可能是 IC≠PnL 的结构性根因**:alphagen 实证互 IC 0.97 两因子组合
+   超各自、IC 0.0011 因子提升组合——**重启研究环则验收单位应为"因子池"**
+   (配 A2 协方差熵 + AlphaSAGE R_NOV 查新);互 IC 阈值过滤被 alphagen 实测否决
+3. **过拟合机制解释齐了**:RL 单峰→IS 过拟合(单因子 PPO IC 为负);GFN 按 reward
+   采样→多峰;AlphaForge 用滚动低维线性重拟合替代静态冻结——Gate 2 的学术镜像
+4. **Gate 0.5 获外部实证背书**(PFS↔MaxDD);A2 的标准实现 = AlphaEval DH 特征值熵
+5. **LLM 热度≠效果**:QuantaAlpha(GPT-5.2)IC 0.047 < GFN 0.079;但轨迹级复用 +
+   假设-代码一致性约束值得抄进研究环 agent 工作流
+
+### 🧭 留到下阶段
+- A2 固化(DH + R_NOV 双实现)待组合装配时;Gate 2 可选增项 RRE
+- 若重启研究环:GFlowNet 范式 + 池级验收 + Qlib 数据层是首选组合
+- PR #91 裁决;Goinmax 干净镜像(Goinmax-clean.git)推送待用户一句话
+
 ## 2026-11-02 · Goinmax 密钥剥离完成(隔离镜像,原仓零改动)
 
 **分支:** `~/Desktop/Claude/Goinmax-clean.git`(隔离镜像,未推送)· **Agents:** 无
