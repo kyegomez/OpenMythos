@@ -375,6 +375,38 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-08 · 夜间自主推进:池级验收管道 v0 建成,4/4 FAIL 收束再确认
+
+**分支:** QuantKB(pool 基础设施)+ 本条目 · **Agents:** 无 · **约束:全程零 Goinmax 操作** ✅
+
+### ✅ 完成
+- **A2 固化(TDD)**:`quantkb/diversity_metrics.py`——DH 协方差熵(AlphaEval
+  特征值谱香农熵)+ R_NOV 查新(AlphaSAGE,留一法)+ 互 IC 矩阵 + 池摘要;7 tests
+- **池组合模块(TDD)**:`quantkb/factor_pool.py`——IS 冻结 z-score、等权/IC 权/
+  岭回归闭式(alphagen GD 的确定性精确替代,λ=1e-2·k 设计常数)/Top-K;7 tests
+- **预注册实验**(docs/pool_gate_design.md,结果前锁死验收):12 个已判负因子 ×
+  4 变体 → **4/4 Gate 1 FAIL,收束判决池级再确认**;P3 精选池唯一亮点
+  (AR −0.99% 跑赢 B&H 6.4pp,IR +0.08 差两个数量级)
+- **五维记分卡**:`tools/factor_scorecard.py`(时序域适配:Spearman 用 rank-Pearson
+  定义实现免 scipy;逻辑维=规则代理,A3 约束不调 LLM)——PFS 12/12=1.00
+  (闭式泛函零区分度,佐证 A1 定位);bb_lower_20 被非平稳旗正确标记
+- **晨报**:`docs/overnight_report_2026-11-08.md`;数据自愈一次(/tmp 清理→fapi 重建)
+
+### 📊 测试变化
+- QuantKB: 116 → **130 passed / 1 skipped**(+14 diversity/pool)+ ruff 零错
+
+### 🔑 关键决策 / 发现
+- **深读硬结论 #2 实证否定(在本因子集上)**:"验收单位改池"不无中生有预测力——
+  alphagen 池协同的前提(入池因子各有正边际)不成立,等权池 −54% 是直接证据;
+  池化只改善组合画像(P3 G2 全 PASS)
+- 最强 OOS |IC|(−0.105)恰是记分卡非平稳旗因子——"大|IC|+价格水平=伪回归"再现;
+  对照行 0 交易 = 符号映射在非平稳因子上退化的活教材(M4 教训第 3 次复现)
+- 岭回归闭式替代 alphagen 增量 GD:冻结 IS 拟合容许精确解,确定性 + 可测试
+
+### 🧭 留到下阶段
+- 用户决策:Goinmax 干净镜像推送 / PR #91 / risk-overlay-zh 并回(等回滚实验)
+- 可选:laya 离线标注;入池资格线设计(若重启研究环的前置件)
+
 ## 2026-11-07 · 七篇因子论文深度研读入库(4 篇全文级)
 
 **分支:** 本条目(Obsidian 深读)· **Agents:** 无 · **约束:全程零 Goinmax 操作** ✅
