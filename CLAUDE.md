@@ -375,6 +375,33 @@ All work in this project must reference the phase/item below when opening a PR (
 
 ## 进度条目(倒序,最新在上)
 
+## 2026-11-08 · 夜间自主推进完卷:回归夜 5/5 零回归 + 标题语料积累器上线
+
+**分支:** QuantKB + 本条目 · **Agents:** 无 · **约束:全程零 Goinmax 操作** ✅
+
+### ✅ 完成(Phase 6/7,接前条)
+- **工具链回归夜**:重建面板(fapi 期货)复跑全部 5 套历史 gate——
+  v3_factor_gate G1 0/9 ✓、goinmax_gate1 0/8 ✓、extreme_reversion V1 FAIL/V4
+  84 笔 ✓、conditional_regime C1 84 笔/C2 18 笔逐位一致 ✓、**risk_overlay_gate
+  C1×O3 v1 PASS 保持**(+0.55%/MDD 6.23%)——**零回归**;微差均溯源期现数据源
+- **标题语料积累器(TDD)**:`append_headline_archive`(append-only 时间戳日志,
+  窗口去重)+ `--archive` 接入 + launchd 升级;首跑归档 **633 条**简繁英文混合
+  标题——M3 §7 微调分类器语料从此每 10 分钟自动积累
+- 晨报终版(docs/overnight_report_2026-11-08.md):含回归矩阵与最终账目
+
+### 📊 测试变化
+- QuantKB: 130 → **132 passed / 1 skipped**(+2 archive)+ ruff 全仓零错
+
+### 🔑 关键决策 / 发现
+- **回归夜的元价值**:所有历史负结果(0/9、0/8、4/4 FAIL)在独立重建的数据上
+  原样复现——负结果的可复现性是这套基础设施最硬的质量证明
+- 语料积累器补上了 M3 升级路径的时间瓶颈:此前语料"等将来攒",现在从今晚起
+  自动滚存,laya 离线标注随时可开工
+- v1 风控叠加层获批形态在期现两种数据源上同时 PASS——鲁棒性旁证
+
+### 🧭 留到下阶段(用户晨间清单)
+- Goinmax 干净镜像推送 / PR #91 / risk-overlay-zh 并回(等回滚实验)/ laya 标注开工
+
 ## 2026-11-08 · 夜间自主推进:池级验收管道 v0 建成,4/4 FAIL 收束再确认
 
 **分支:** QuantKB(pool 基础设施)+ 本条目 · **Agents:** 无 · **约束:全程零 Goinmax 操作** ✅
