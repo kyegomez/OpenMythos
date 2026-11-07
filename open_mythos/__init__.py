@@ -15,6 +15,8 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
+from open_mythos.kv_cache import StaticKVCache
+from open_mythos.primitives.quant import BitLinear, absmax_act_quant, absmean_quantize
 from open_mythos.tokenizer import MythosTokenizer
 from open_mythos.variants import (
     mythos_1b,
@@ -49,7 +51,9 @@ __all__ = [
     "mythos_100b",
     "mythos_500b",
     "mythos_1t",
-    "load_tokenizer",
-    "get_vocab_size",
     "MythosTokenizer",
+    "StaticKVCache",
+    "BitLinear",
+    "absmean_quantize",
+    "absmax_act_quant",
 ]

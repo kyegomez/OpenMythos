@@ -1,5 +1,3 @@
-from transformers import AutoTokenizer
-
 DEFAULT_MODEL_ID = "openai/gpt-oss-20b"
 
 
@@ -27,6 +25,7 @@ class MythosTokenizer:
         Args:
             model_id (str): HuggingFace model identifier or path to tokenizer files.
         """
+        from transformers import AutoTokenizer  # lazy import
         self.tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     @property
@@ -61,4 +60,10 @@ class MythosTokenizer:
         Returns:
             str: Decoded string representation of the token IDs.
         """
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        # AutoTokenizer.decode overloads return List[str] when given batched
+        # input; we always pass a flat List[int] so the concrete return is
+        # always str. mypy can't narrow through the Union without a stub
+        # override, so assert + ignore return-value.
+        out = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        assert isinstance(out, str), f"expected str from tokenizer.decode, got {type(out)}"
+        return out

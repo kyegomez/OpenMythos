@@ -54,6 +54,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from open_mythos.primitives.norm import RMSNorm
+from open_mythos.primitives.expert import Expert as DeepSeekExpert
+
 
 @dataclass
 class MoDAConfig:
@@ -126,34 +129,6 @@ class MoDAConfig:
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (no bias, no mean subtraction)."""
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
-        """Create an RMSNorm layer.
-
-        Args:
-            dim: Feature dimension to normalise over (the last axis of input).
-            eps: Stability constant added before the reciprocal square-root to
-                 prevent division by zero when the RMS is near zero.
-        """
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalise *x* by its root-mean-square and apply a learnable scale.
-
-        Args:
-            x: Input tensor of arbitrary shape ``[..., dim]``.
-
-        Returns:
-            Normalised tensor, same shape as *x*.
-        """
-        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return x * rms * self.weight
 
 
 class RotaryEmbedding(nn.Module):
@@ -258,49 +233,6 @@ def apply_rotary_emb(
 # ---------------------------------------------------------------------------
 # DeepSeek MoE FFN
 # ---------------------------------------------------------------------------
-
-
-class DeepSeekExpert(nn.Module):
-    """Single fine-grained SwiGLU expert.
-
-    Faithful to DeepSeek-V3 ``Expert``:
-        output = w2( SiLU(w1(x)) ⊙ w3(x) )
-
-    where w1 is the gate projection, w3 the up-projection, w2 the
-    down-projection — identical to a SwiGLU FFN at smaller hidden dim.
-
-    Args:
-        d_model:    Input / output dimension.
-        hidden_dim: Expert intermediate dimension (≪ dense FFN hidden_dim).
-    """
-
-    def __init__(self, d_model: int, hidden_dim: int) -> None:
-        """Create a single fine-grained SwiGLU expert.
-
-        Args:
-            d_model:    Token hidden dimension (input and output size).
-            hidden_dim: Expert intermediate dimension.  Typically much
-                        smaller than the dense FFN hidden dim — set to
-                        ``dense_hidden / m`` where *m* is the fine-grained
-                        segmentation factor so total activated FLOPs match
-                        the dense baseline.
-        """
-        super().__init__()
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)  # gate
-        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)  # up
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)  # down
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute ``w2( SiLU(w1(x)) ⊙ w3(x) )``.
-
-        Args:
-            x: Token features assigned to this expert, shape
-               ``[num_assigned_tokens, d_model]``.
-
-        Returns:
-            Expert output, shape ``[num_assigned_tokens, d_model]``.
-        """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class DeepSeekGate(nn.Module):
@@ -557,16 +489,21 @@ class DeepSeekMoE(nn.Module):
 
         y = torch.zeros_like(x_flat)
 
-        # Dispatch: for each expert compute on its assigned tokens
-        # (token-major loop matches DeepSeek-V3's reference implementation)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts)
+        # Dispatch: for each expert compute on its assigned tokens.
+        # Amortize the CUDA sync: convert `counts` to a Python list once
+        # (one sync) instead of `counts[i].item()` per expert iteration
+        # (N syncs). Mirror of the P3.2 optimization applied to main.py's
+        # MoEFFN. `index_add_` scatter replaces masked assign for
+        # torch.compile friendliness.
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
         for i, expert in enumerate(self.experts):
-            if counts[i].item() == 0:
+            if counts[i] == 0:
                 continue
-            tok_idx, rank_in_k = torch.where(
-                indices == i
-            )  # which tokens & which K slot
-            y[tok_idx] += expert(x_flat[tok_idx]) * weights[tok_idx, rank_in_k, None]
+            tok_idx, rank_in_k = torch.where(indices == i)
+            expert_out = expert(x_flat[tok_idx]) * weights[tok_idx, rank_in_k, None]
+            y.index_add_(0, tok_idx, expert_out)
 
         output = (y + z).view(shape)
 
@@ -647,9 +584,9 @@ class _SharedFFN(nn.Module):
                         (``n_shared_experts × expert_hidden_dim``).
         """
         super().__init__()
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.gate = nn.Linear(d_model, hidden_dim, bias=False)
+        self.up = nn.Linear(d_model, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the shared SwiGLU FFN to every token.
@@ -660,7 +597,7 @@ class _SharedFFN(nn.Module):
         Returns:
             Transformed features, shape ``[B*T, d_model]``.
         """
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +830,24 @@ class MoDABlock(nn.Module):
         """
         B, T, _ = x.shape
 
+        # SILENT-FAILURE GUARD: depth-write RoPE (and attention RoPE below)
+        # assume ``cos`` / ``sin`` span the CURRENT forward's token positions.
+        # MoDA rebuilds the depth KV cache per forward today, so position ==
+        # index-in-batch. A future autoregressive-decode refactor must slice
+        # cos/sin to the current token's absolute position — otherwise
+        # position-0 rotation is silently applied to every decoded token
+        # (the same class of bug that bit main.py GQA/MLA's generate path;
+        # see ANALYSIS_REPORT silent-failure catalog). Check up front so the
+        # error message is actionable rather than an opaque tensor-shape
+        # failure deep inside attention.
+        if cos.shape[-2] != T:
+            raise RuntimeError(
+                f"MoDA k_write RoPE: cos.shape[-2]={cos.shape[-2]} does not "
+                f"match the current token count T={T}. If you added "
+                f"autoregressive decode, slice cos/sin to the current token's "
+                f"absolute positions rather than passing the full [0, T) table."
+            )
+
         # Post-norm attention sub-layer
         x = self.norm_attn(x + self.attn(x, depth_k_cache, depth_v_cache, cos, sin))
 
@@ -908,7 +863,8 @@ class MoDABlock(nn.Module):
             self.v_write(x).view(B, T, self._n_heads_kv, self._head_dim).transpose(1, 2)
         )
 
-        # RoPE on k_write for positional consistency during future depth reads
+        # RoPE on k_write for positional consistency during future depth reads.
+        # cos/sin shape vs T is already guarded at the top of forward().
         k_write = apply_rotary_emb(k_write, cos, sin)
 
         return x, k_write, v_write, balance_loss
@@ -967,9 +923,10 @@ class MoDAModel(nn.Module):
 
         Called automatically at the end of :meth:`__init__`.
         """
+        from open_mythos.model import _INIT_STD
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Embedding)):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                nn.init.normal_(m.weight, mean=0.0, std=_INIT_STD)
             elif isinstance(m, DeepSeekGate):
                 nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
 
@@ -1061,3 +1018,4 @@ class MoDAModel(nn.Module):
             f"(top-{c.n_activated_experts}), "
             f"params={self.num_parameters():,}"
         )
+

@@ -1,0 +1,43 @@
+# Pre-commit hooks for OpenMythos.
+#
+# Run locally:
+#     pre-commit install        # one-time — installs git hook
+#     pre-commit run --all-files  # manual full-repo run
+#
+# Auto-runs on every `git commit`. Hooks are pinned to specific revs to keep
+# the lint surface stable across contributor machines and CI.
+
+repos:
+  # ---- Hygiene ---------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: debug-statements  # no stray breakpoint()/pdb.set_trace()
+
+  # ---- Ruff: fast lint + format (replaces isort / flake8 / pyupgrade) -------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.1
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # ---- Type checking (advisory locally; CI also runs it) --------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.20.2
+    hooks:
+      - id: mypy
+        # Config lives in pyproject.toml [tool.mypy]; only re-type-check the
+        # first-party tree. Additional deps installed so mypy sees them.
+        additional_dependencies:
+          - "torch>=2.1,<3.0"
+        # Only lint the source tree, not tests (they monkey-patch internals).
+        files: ^(open_mythos|training)/.*\.py$
+        exclude: ^open_mythos/experimental/.*

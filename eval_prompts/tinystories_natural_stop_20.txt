@@ -1,0 +1,22 @@
+# TinyStories-style prompts for natural-stop evaluation.
+# Blank lines and comment lines are ignored by examples.evaluate_small_lm_generations.
+Once upon a time
+Tom lost his red ball
+Lily found a small door in the garden
+Ben saw a tiny dragon under the bed
+Mia heard a bell in the forest
+Sam built a boat from paper
+A little rabbit wanted to fly
+Nora found a glowing shell
+The puppy would not go to sleep
+Ella planted a magic seed
+Jack dropped his cookie in the mud
+The moon looked very close tonight
+A bear forgot where he put his hat
+Sophie saw a star fall into the pond
+The little train stopped on the hill
+Max found a map under his pillow
+A duck wanted to learn to sing
+Ruby made a cake for her grandma
+The wind took Leo's blue kite
+A sleepy turtle missed the picnic

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Manual trigger for debugging.
+  workflow_dispatch:
+
+# Cancel stale runs on the same ref when a new push lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install runtime deps
+        # torch CPU wheel keeps the runner fast and avoids CUDA-only behaviour
+        # (SDPA path includes the torch<2.5 fallback verified in this project).
+        # transformers/datasets/loguru are required by training/ imports and
+        # by the checkpoint-related tests in tests/test_training.py.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install "numpy<2" pytest pytest-timeout "transformers>=4.40.0" "datasets>=2.18.0" "loguru>=0.7.3"
+
+      - name: Show environment
+        run: |
+          python --version
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+          pip list | grep -iE 'torch|numpy|datasets|transformers|loguru|pytest'
+
+      - name: Run pytest
+        # tests/test_tokenizer.py is excluded because it downloads a HF model
+        # on first use and would make CI flaky on network hiccups. The rest
+        # (184 tests) run fully offline.
+        run: |
+          python -W ignore -m pytest tests/ \
+            --ignore=tests/test_tokenizer.py \
+            --timeout=120 \
+            -v --tb=short
+
+  lint:
+    name: ruff check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install 'ruff>=0.5.1,<0.15.9'
+      - name: ruff check
+        # Enforced: lint regressions block PR merge.
+        run: ruff check .
+
+  typecheck:
+    name: mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install typecheck deps
+        # mypy + the runtime deps it needs to trace through torch + training.
+        # Matches [tool.mypy] config in pyproject.toml.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install 'mypy>=1.10' 'numpy<2'
+      - name: mypy
+        # Config lives in pyproject.toml; currently passes with 0 errors on
+        # main. Enforced (no continue-on-error) so regressions block.
+        run: python -m mypy --no-incremental

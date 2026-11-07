@@ -1,5 +1,9 @@
 __pycache__/
 .venv/
+.venv-arm64/
+.codex/
+checkpoints/
+runs/
 
 .env
 
@@ -11,7 +15,10 @@ dataframe/
 .ruff_cache
 target/
 Cargo.lock
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/settings.local.json
 .pytest_cache
 dist
 
@@ -31,6 +38,8 @@ experimental
 ffn_alternatives
 artifacts_five
 experimental/
+!open_mythos/experimental/
+!open_mythos/experimental/**
 encryption
 errors
 chroma
@@ -427,4 +436,3 @@ flycheck_*.el
 
 # network security
 /network-security.data
-
