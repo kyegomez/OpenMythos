@@ -126,6 +126,19 @@ The whole premise is that more loop iterations buy more reasoning. [`examples/de
 python examples/depth_extrapolation.py
 ```
 
+The table it prints ends with a `loops run` row: the recurrent depth the model *actually* executed before ACT halted every position. If that row stays at 1 while you request 6 or 12 loops, the halting head is cutting the computation short and the accuracy columns cannot differ; pass `--act-threshold 1.0` to force every requested loop to run.
+
+The small default (271k params) proves the pipeline on a laptop CPU but is too small to show the depth effect. For a real attempt on a GPU box:
+
+```bash
+python examples/depth_extrapolation.py --preset big --device cuda \
+    --states 12 --k-train 4 --k-test 8 --train-loops 8 \
+    --act-threshold 1.0 --steps 40000 --batch 256 --warmup 500 \
+    --eval-loops 1 2 4 8 16 --eval-every 5000 --save-dir runs/depth_big
+```
+
+`--preset big` (about 13M params) only sets model-size defaults; `--dim`, `--experts`, `--lora-rank`, `--prelude`, `--coda` and friends override any of them. `--save-dir` writes the safetensors checkpoint plus a `results.json` with the loss history and the full accuracy table, and `--resume DIR` re-evaluates a saved model without retraining. See `--help` for the full list.
+
 During training it also calls `model.update_router_bias()` each step, which applies the DeepSeek-V3 aux-loss-free load-balancing update to the MoE router so experts stay balanced.
 
 ## Model Variants
