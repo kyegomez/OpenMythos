@@ -96,14 +96,37 @@ print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
 out = model.generate(ids, max_new_tokens=8, n_loops=8)
 print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
 
+# get_A() returns the diagonal of the (diagonal) state matrix, so its entries
+# ARE the eigenvalues — the spectral radius is just their max magnitude.
 A = model.recurrent.injection.get_A()
-rho = torch.linalg.eigvals(A).abs().max().item()
+rho = A.abs().max().item()
 print(
     f"[{attn_type.upper()}] Spectral radius ρ(A) = {rho:.4f} (must be < 1)"
 )
 ```
 
 
+
+## Saving and loading
+
+Checkpoints use [safetensors](https://github.com/huggingface/safetensors), not `torch.save`/pickle, so loading a checkpoint never executes code:
+
+```python
+model.save_pretrained("ckpt/")           # writes config.json + model.safetensors
+model = OpenMythos.from_pretrained("ckpt/")
+```
+
+`forward` validates its inputs: token ids outside `[0, vocab_size)` and positions beyond `max_seq_len` raise a clear `ValueError` instead of reading out of bounds. The core model imports only `torch`; `transformers` is pulled in lazily and only by `MythosTokenizer`.
+
+## Does the looping actually do anything?
+
+The whole premise is that more loop iterations buy more reasoning. [`examples/depth_extrapolation.py`](examples/depth_extrapolation.py) tests this directly: it trains a small model on iterated pointer-chasing (compute `P^k(s)` for a fresh random permutation each example, which cannot be memorized and needs `k` sequential steps), then reports accuracy as a function of the inference loop count, including hop counts never seen in training.
+
+```bash
+python examples/depth_extrapolation.py
+```
+
+During training it also calls `model.update_router_bias()` each step, which applies the DeepSeek-V3 aux-loss-free load-balancing update to the MoE router so experts stay balanced.
 
 ## Model Variants
 
@@ -121,11 +144,10 @@ from open_mythos import (
     OpenMythos,
 )
 
-cfg = mythos_7b()  # returns a MythosConfig
+cfg = mythos_3b()  # returns a MythosConfig
 model = OpenMythos(cfg)
 
-total = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {total:,}")
+print(f"Parameters: {model.num_parameters():,}")
 ```
 
 | Variant | `dim` | Experts | `expert_dim` | Loop iters | Context | Max output |
