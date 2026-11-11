@@ -247,7 +247,10 @@ class GQAttention(nn.Module):
                 v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
             kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
 
-        if _HAS_FLASH_ATTN:
+        if _HAS_FLASH_ATTN and q.is_cuda:
+            # flash_attn_func is CUDA-only; a CPU model (or a CPU unit test on a
+            # machine that happens to have flash-attn installed) takes the
+            # fallback below.
             # flash_attn_func expects (B, T, H, head_dim) — GQA is handled natively
             # (n_kv_heads < n_heads is supported without repeat_interleave).
             # causal=True when mask is present (full-sequence prefill/training);
@@ -894,18 +897,25 @@ class RecurrentBlock(nn.Module):
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
-        cumulative_p = torch.zeros(B, T, device=h.device)
+        # Halting bookkeeping stays in float32 whatever the activation dtype:
+        # bf16/fp16 cannot accumulate probabilities against a 0.99 threshold
+        # accurately, and mixing a float32 weight into h would silently promote
+        # the whole residual stream to float32 in a half-precision model.
+        cumulative_p = torch.zeros(B, T, device=h.device, dtype=torch.float32)
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
-            combined = self.norm(h_loop + e)
+            # Normalize first, then add the loop-index signal. The signal has
+            # O(1) magnitude; added before the norm it swamps a freshly
+            # initialized hidden state (RMS ~0.02), making every token look
+            # the same to attention and collapsing MoE routing onto two experts.
+            combined = loop_index_embedding(self.norm(h + e), t, self.loop_dim)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
-            p = self.act(h)  # (B, T)
+            p = self.act(h).float()  # (B, T), float32 for the halting math
             still_running = ~halted
 
             # ACT remainder trick: once cumulative_p + p crosses threshold,
@@ -920,7 +930,7 @@ class RecurrentBlock(nn.Module):
                 p,
             )
             weight = weight * still_running.float()
-            h_out = h_out + weight.unsqueeze(-1) * h
+            h_out = h_out + weight.unsqueeze(-1).to(h.dtype) * h
 
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
@@ -999,6 +1009,26 @@ class OpenMythos(nn.Module):
         self.head.weight = self.embed.weight  # weight tying
 
         self._init_weights()
+
+    _ROPE_BUFFERS = ("freqs_cis", "freqs_cis_mla")
+
+    def _apply(self, fn, *args, **kwargs):
+        """
+        Keep the RoPE tables complex when the model is cast to another dtype.
+
+        ``Module.to(dtype=...)`` casts complex buffers to the real target dtype
+        and drops the imaginary part, which silently turns every RoPE rotation
+        into a plain rescale. ``apply_rope`` always works in complex64 and
+        returns the caller's dtype, so the tables only ever need to follow the
+        model's device, never its dtype.
+        """
+        saved = {n: self._buffers.get(n) for n in self._ROPE_BUFFERS}
+        out = super()._apply(fn, *args, **kwargs)
+        for name, old in saved.items():
+            new = self._buffers.get(name)
+            if old is not None and new is not None and not new.is_complex():
+                self._buffers[name] = old.to(new.device)
+        return out
 
     def _init_weights(self) -> None:
         """Initialize all linear and embedding weights with N(0, 0.02)."""
