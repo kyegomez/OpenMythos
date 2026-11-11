@@ -276,6 +276,11 @@ def build_parser():
     )
     g.add_argument("--dropout", type=float, default=0.0)
     g.add_argument(
+        "--act-final-remainder", action="store_true",
+        help="model option: unused halting mass goes to the last loop that runs "
+             "(MythosConfig.act_final_remainder)",
+    )
+    g.add_argument(
         "--readout", choices=["act", "last"], default="act",
         help="ablation: 'last' returns the hidden state after the final loop "
              "instead of the ACT-weighted sum over loops (no halting)",
@@ -295,6 +300,12 @@ def build_parser():
     g.add_argument("--weight-decay", type=float, default=0.01)
     g.add_argument("--warmup", type=int,
                    help="linear LR warmup steps (default: 0 for small, 500 for big)")
+    g.add_argument(
+        "--aux-readout", type=float, default=0.0,
+        help="weight of an auxiliary loss (needs --k-encoding none): one shared "
+             "linear head must read P^t(s) from the recurrent state after every "
+             "loop t, so the block keeps the pointer in the same code each loop",
+    )
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--device", default="auto", help="cpu, cuda, cuda:1, mps, or auto")
     g.add_argument("--threads", type=int, help="torch CPU threads (default: torch's choice)")
@@ -347,6 +358,7 @@ def make_config(args, task) -> MythosConfig:
         expert_dim=p["expert_dim"],
         lora_rank=p["lora_rank"],
         act_threshold=args.act_threshold,
+        act_final_remainder=args.act_final_remainder,
         dropout=args.dropout,
     )
 
@@ -394,6 +406,8 @@ def main():
         # halting would break the one-hop-per-loop correspondence.
         args.train_loops = args.k_train
         args.act_threshold = 1.0
+    if args.aux_readout and args.k_encoding != "none":
+        raise SystemExit("--aux-readout needs --k-encoding none (one loop = one hop)")
     task = PointerChase(args.states, args.k_test, args.k_encoding)
     cfg = make_config(args, task)
     if args.resume:
@@ -431,7 +445,19 @@ def main():
     history = []
 
     if not args.resume:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        params = list(model.parameters())
+        loop_states = []
+        if args.aux_readout:
+            # One linear head reads the pointer straight from the recurrent
+            # state after every loop. Sharing it across loops forces the block
+            # to write its result in the same code it reads, which is what a
+            # fourth, never-trained loop needs.
+            aux_head = torch.nn.Linear(cfg.dim, task.M).to(device)
+            params += list(aux_head.parameters())
+            model.recurrent.injection.register_forward_hook(
+                lambda mod, inp, out: loop_states.append(out[:, -1])
+            )
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=max(1, args.steps - args.warmup)
         )
@@ -450,11 +476,19 @@ def main():
                 x, y = task.batch(args.batch, train_ks, gen)
                 step_loops = args.train_loops
             x, y = x.to(device), y.to(device)
+            loop_states.clear()
             logits = model(x, n_loops=step_loops)[:, -1, :]
             loss = F.cross_entropy(logits, y)
+            if args.aux_readout:
+                table, cur = x[:, : task.M], x[:, task.M + 1]
+                aux = 0.0
+                for state in loop_states:  # state after loop t holds P^t(s)
+                    cur = table.gather(1, cur.unsqueeze(1)).squeeze(1)
+                    aux = aux + F.cross_entropy(aux_head(state), cur)
+                loss = loss + args.aux_readout * aux / len(loop_states)
             opt.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             if not args.warmup or step > args.warmup:
                 cosine.step()
