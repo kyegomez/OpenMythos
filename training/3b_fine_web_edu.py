@@ -41,6 +41,33 @@ from open_mythos.tokenizer import MythosTokenizer
 # ---------------------------------------------------------------------------
 
 
+def shard_stream(ds, total_shards: int, shard_index: int):
+    """
+    Give one `(rank, worker)` consumer its own disjoint slice of a streaming dataset.
+
+    `IterableDataset.shard` splits by source file, so it only works while there
+    are at least as many files as consumers; past that it raises IndexError
+    (e.g. 4 GPUs x 4 workers = 16 consumers on a subset with fewer files).
+    In that case fall back to splitting by document: every consumer reads the
+    whole stream and keeps each `total_shards`-th document. Coverage stays
+    disjoint and complete; the cost is that skipped documents are still read.
+
+    Args:
+        ds           -- streaming dataset (iterable of samples)
+        total_shards -- number of consumers, world_size * num_workers
+        shard_index  -- this consumer's index in [0, total_shards)
+
+    Returns:
+        An iterable over this consumer's samples.
+    """
+    n_files = getattr(ds, "num_shards", None) or getattr(ds, "n_shards", None)
+    if n_files is not None and n_files >= total_shards:
+        return ds.shard(num_shards=total_shards, index=shard_index)
+    return (
+        sample for i, sample in enumerate(ds) if i % total_shards == shard_index
+    )
+
+
 class FineWebEduDataset(IterableDataset):
     """
     Streaming FineWeb-Edu loader yielding fixed-length (input, target) pairs.
@@ -50,6 +77,8 @@ class FineWebEduDataset(IterableDataset):
     `world_size` ranks × `num_workers` DataLoader workers per rank — and each
     `(rank, worker_id)` deterministically owns one shard of the global stream.
     That gives disjoint coverage without any cross-process coordination.
+    When there are more consumers than source files the split falls back from
+    per-file to per-document (see `shard_stream`).
 
     Streaming datasets are not seekable, so a resumed run re-enters its shard
     from the beginning. Acceptable at pretraining scale: the chance of
@@ -90,12 +119,16 @@ class FineWebEduDataset(IterableDataset):
         total_shards = self.world_size * num_workers
         shard_index = self.rank * num_workers + worker_id
 
-        ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name=self.subset,
-            split="train",
-            streaming=True,
-        ).shard(num_shards=total_shards, index=shard_index)
+        ds = shard_stream(
+            load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                name=self.subset,
+                split="train",
+                streaming=True,
+            ),
+            total_shards,
+            shard_index,
+        )
 
         buf = []
         for sample in ds:
