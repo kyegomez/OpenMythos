@@ -193,3 +193,52 @@ def test_act_early_exit_off_runs_every_loop_with_same_output():
     assert n_early < 6
     assert n_full == 6
     assert torch.allclose(early, full, atol=1e-5)
+
+
+def test_act_final_remainder_makes_loop_weights_sum_to_one():
+    """With a halting head that never halts, the default drops almost all the
+    weight; with act_final_remainder the last loop takes it and the output is
+    the final hidden state."""
+    torch.manual_seed(0)
+    captured = {}
+
+    def run(final_remainder):
+        cfg = make_cfg(act_threshold=1.0, max_loop_iters=4, act_final_remainder=final_remainder)
+        torch.manual_seed(0)
+        model = OpenMythos(cfg).to(DEVICE).eval()
+        with torch.no_grad():
+            model.recurrent.act.halt.bias.fill_(-20.0)  # p ~ 2e-9 every loop
+        states = []
+        hook = model.recurrent.injection.register_forward_hook(lambda m, i, o: states.append(o))
+        out = []
+        coda_in = model.coda[0].register_forward_pre_hook(lambda m, a: out.append(a[0]))
+        ids = torch.randint(0, cfg.vocab_size, (2, 12), device=DEVICE)
+        with torch.no_grad():
+            model(ids, n_loops=4)
+        hook.remove()
+        coda_in.remove()
+        return states[-1], out[0]
+
+    last_state, h_out = run(final_remainder=True)
+    assert torch.allclose(h_out, last_state, atol=1e-5)
+
+    last_state, h_out = run(final_remainder=False)
+    assert h_out.abs().max() < 1e-5 * max(1.0, last_state.abs().max().item())
+
+
+def test_act_final_remainder_leaves_halted_positions_alone():
+    """Positions that halt before the last loop get nothing extra there."""
+    torch.manual_seed(0)
+    ids = None
+    outs = []
+    for final_remainder in (False, True):
+        cfg = make_cfg(act_threshold=0.5, max_loop_iters=4, act_final_remainder=final_remainder)
+        torch.manual_seed(0)
+        model = OpenMythos(cfg).to(DEVICE).eval()
+        with torch.no_grad():
+            model.recurrent.act.halt.bias.fill_(10.0)  # every position halts on loop 1
+        if ids is None:
+            ids = torch.randint(0, cfg.vocab_size, (2, 12), device=DEVICE)
+        with torch.no_grad():
+            outs.append(model(ids, n_loops=4))
+    assert torch.allclose(outs[0], outs[1], atol=1e-6)

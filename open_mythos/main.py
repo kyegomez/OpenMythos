@@ -46,6 +46,13 @@ class MythosConfig:
 
     Other:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
+        act_final_remainder -- give each still-running position's unused halting
+                           mass to the last loop that runs, as in Graves' ACT, so
+                           the loop weights always sum to 1. Off, a position that
+                           has not halted when the loops end simply loses that
+                           mass, which pushes training to halt by the deepest
+                           trained loop and blocks deeper inference (see
+                           examples/depth_extrapolation.py).
         act_early_exit  -- stop looping once every position has halted. Turn off under
                            FSDP/DDP training: the loop count then depends on each
                            rank's data, ranks issue different numbers of collectives,
@@ -78,6 +85,7 @@ class MythosConfig:
     # ACT halting
     act_threshold: float = 0.99
     act_early_exit: bool = True
+    act_final_remainder: bool = False
     # RoPE
     rope_theta: float = 500000.0
     # LoRA depth adaptation
@@ -929,11 +937,11 @@ class RecurrentBlock(nn.Module):
             # once (on the halting step) and zero thereafter — otherwise
             # threshold<1 leaves a non-zero remainder that leaks every step.
             remainder = (1.0 - cumulative_p).clamp(min=0)
-            weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
-                remainder,
-                p,
-            )
+            takes_remainder = cumulative_p + p >= self.cfg.act_threshold
+            if self.cfg.act_final_remainder and t == n_loops - 1:
+                # Last loop that will run: whatever mass is left goes here.
+                takes_remainder = torch.ones_like(takes_remainder)
+            weight = torch.where(takes_remainder, remainder, p)
             weight = weight * still_running.float()
             h_out = h_out + weight.unsqueeze(-1).to(h.dtype) * h
 
