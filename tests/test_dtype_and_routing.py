@@ -168,3 +168,28 @@ class TestFlashAttnGuard:
         with torch.no_grad():
             logits = model(ids)
         assert logits.shape == (2, 8, 500)
+
+
+def test_act_early_exit_off_runs_every_loop_with_same_output():
+    """With early exit off the loop count is fixed (needed under FSDP) and the
+    output is unchanged, because halted positions carry zero weight."""
+    torch.manual_seed(0)
+    cfg = make_cfg(act_threshold=0.5, max_loop_iters=6)
+    model = OpenMythos(cfg).to(DEVICE).eval()
+    block = model.recurrent.block
+    calls = []
+    hook = block.register_forward_hook(lambda *_: calls.append(1))
+    ids = torch.randint(0, cfg.vocab_size, (2, 16), device=DEVICE)
+    with torch.no_grad():
+        # Push the halting head high so every position halts on loop 1.
+        model.recurrent.act.halt.bias.fill_(10.0)
+        early = model(ids)
+        n_early = len(calls)
+        calls.clear()
+        cfg.act_early_exit = False
+        full = model(ids)
+        n_full = len(calls)
+    hook.remove()
+    assert n_early < 6
+    assert n_full == 6
+    assert torch.allclose(early, full, atol=1e-5)

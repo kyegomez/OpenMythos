@@ -46,6 +46,10 @@ class MythosConfig:
 
     Other:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
+        act_early_exit  -- stop looping once every position has halted. Turn off under
+                           FSDP/DDP training: the loop count then depends on each
+                           rank's data, ranks issue different numbers of collectives,
+                           and the run deadlocks. The output is the same either way.
         rope_theta      -- RoPE base frequency
         lora_rank       -- rank of the per-loop depth-wise LoRA adapter
     """
@@ -73,6 +77,7 @@ class MythosConfig:
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
     # ACT halting
     act_threshold: float = 0.99
+    act_early_exit: bool = True
     # RoPE
     rope_theta: float = 500000.0
     # LoRA depth adaptation
@@ -938,7 +943,7 @@ class RecurrentBlock(nn.Module):
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
+            if self.cfg.act_early_exit and halted.all() and kv_cache is None:
                 break
 
         return h_out

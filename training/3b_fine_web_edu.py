@@ -424,6 +424,11 @@ def main():
     model = OpenMythos(cfg)
 
     if ddp:
+        # Each rank must run the same number of loop iterations: the block
+        # inside the recurrent loop is its own FSDP unit and all-gathers its
+        # weights on every iteration, so a rank that halts early stops
+        # answering collectives and the other rank hangs.
+        cfg.act_early_exit = False
         mp_policy = MixedPrecision(
             param_dtype=amp_dtype,
             reduce_dtype=amp_dtype,
