@@ -43,8 +43,8 @@ Big machine (GPU, the setting the thesis actually needs):
     python examples/depth_extrapolation.py --preset big --device cuda \
         --steps 40000 --save-dir runs/depth_big
 
-`--preset big` only changes the model-size defaults; every value can still be
-overridden by its own flag. See README "Depth-extrapolation demo".
+`--preset big` changes the model-size defaults and the learning rate and warmup
+that go with them; every value can still be overridden by its own flag. See README "Depth-extrapolation demo".
 """
 
 import argparse
@@ -121,6 +121,14 @@ PRESETS = {
     "big": dict(dim=512, heads=8, kv_heads=4, prelude=2, coda=2,
                 experts=8, shared_experts=2, experts_per_tok=2,
                 expert_dim=256, lora_rank=32),
+}
+
+# Learning rate and warmup that go with each preset. The big model does not
+# learn at the small model's 3e-3 (loss stays at chance); 3e-4 with a short
+# warmup does.
+TRAIN_DEFAULTS = {
+    "small": dict(lr=3e-3, warmup=0),
+    "big": dict(lr=3e-4, warmup=500),
 }
 
 
@@ -205,9 +213,11 @@ def build_parser():
     g = ap.add_argument_group("training")
     g.add_argument("--steps", type=int, default=3000)
     g.add_argument("--batch", type=int, default=128)
-    g.add_argument("--lr", type=float, default=3e-3)
+    g.add_argument("--lr", type=float,
+                   help="peak learning rate (default: 3e-3 for small, 3e-4 for big)")
     g.add_argument("--weight-decay", type=float, default=0.01)
-    g.add_argument("--warmup", type=int, default=0, help="linear LR warmup steps")
+    g.add_argument("--warmup", type=int,
+                   help="linear LR warmup steps (default: 0 for small, 500 for big)")
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--device", default="auto", help="cpu, cuda, cuda:1, mps, or auto")
     g.add_argument("--threads", type=int, help="torch CPU threads (default: torch's choice)")
@@ -291,6 +301,9 @@ def eval_table(model, task, args, loop_sweep, gen, device, counter):
 
 def main():
     args = build_parser().parse_args()
+    for key, value in TRAIN_DEFAULTS[args.preset].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
     if args.threads:
         torch.set_num_threads(args.threads)
     device = resolve_device(args.device)
@@ -317,7 +330,10 @@ def main():
         f"lora_rank={cfg.lora_rank} act_threshold={cfg.act_threshold} "
         f"-> {model.num_parameters():,} params, trained at n_loops={args.train_loops}"
     )
-    print(f"Device: {device}  batch={args.batch}  steps={args.steps}\n")
+    print(
+        f"Device: {device}  batch={args.batch}  steps={args.steps}  "
+        f"lr={args.lr:g}  warmup={args.warmup}\n"
+    )
 
     loop_sweep = args.eval_loops or [1, 2, args.train_loops, args.train_loops * 2]
     train_ks = list(range(1, args.k_train + 1))

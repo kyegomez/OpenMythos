@@ -133,11 +133,11 @@ The small default (271k params) proves the pipeline on a laptop CPU but is too s
 ```bash
 python examples/depth_extrapolation.py --preset big --device cuda \
     --states 12 --k-train 4 --k-test 8 --train-loops 8 \
-    --act-threshold 1.0 --steps 40000 --batch 256 --warmup 500 \
+    --act-threshold 1.0 --steps 40000 --batch 256 \
     --eval-loops 1 2 4 8 16 --eval-every 5000 --save-dir runs/depth_big
 ```
 
-`--preset big` (about 13M params) only sets model-size defaults; `--dim`, `--experts`, `--lora-rank`, `--prelude`, `--coda` and friends override any of them. `--save-dir` writes the safetensors checkpoint plus a `results.json` with the loss history and the full accuracy table, and `--resume DIR` re-evaluates a saved model without retraining. See `--help` for the full list.
+`--preset big` (about 13M params) sets model-size defaults plus a matching learning rate and warmup (`--lr 3e-4 --warmup 500`; the small preset's 3e-3 leaves the big model at chance). `--dim`, `--experts`, `--lora-rank`, `--prelude`, `--coda`, `--lr`, `--warmup` and friends override any of them. `--save-dir` writes the safetensors checkpoint plus a `results.json` with the loss history and the full accuracy table, and `--resume DIR` re-evaluates a saved model without retraining. See `--help` for the full list.
 
 During training it also calls `model.update_router_bias()` each step, which applies the DeepSeek-V3 aux-loss-free load-balancing update to the MoE router so experts stay balanced.
 
