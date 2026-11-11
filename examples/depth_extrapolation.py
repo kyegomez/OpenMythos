@@ -73,12 +73,26 @@ class PointerChase:
         ids M+1 .. M+k_max     -- hop-count tokens (k encoded as id M+k)
     """
 
-    def __init__(self, n_states: int, k_max: int):
+    def __init__(self, n_states: int, k_max: int, k_encoding: str = "token"):
+        """
+        k_encoding picks how the hop count reaches the model:
+            "token" -- one token per k (id M+k). A k never seen in training
+                       has an untrained embedding, so the model cannot know
+                       what it means and unseen-k rows cannot beat guessing.
+            "unary" -- k copies of one HOP token (id M+1), left-padded with
+                       SEP to a fixed length. Every token is seen in training;
+                       an unseen k is only a new count.
+            "none"  -- k is not in the input at all. The loop count IS the hop
+                       count: the model must apply P once per loop.
+        """
         self.M = n_states
         self.k_max = k_max
+        self.k_encoding = k_encoding
         self.sep = n_states
+        self.hop = n_states + 1
         self.vocab_size = n_states + 1 + k_max
-        self.seq_len = n_states + 3  # P (M) + SEP + s + k
+        # P (M) + SEP + s + hop-count field (1 token, or k_max tokens for unary)
+        self.seq_len = n_states + 2 + (k_max if k_encoding == "unary" else 1)
 
     def k_token(self, k: int) -> int:
         return self.M + k  # k in 1..k_max -> id M+1..M+k_max
@@ -104,7 +118,15 @@ class PointerChase:
         inputs[:, :M] = P
         inputs[:, M] = self.sep
         inputs[:, M + 1] = s
-        inputs[:, M + 2] = self.M + k
+        if self.k_encoding == "token":
+            inputs[:, M + 2] = self.M + k
+        elif self.k_encoding == "unary":
+            # last k slots are HOP, the ones before them SEP
+            slot = torch.arange(self.k_max).unsqueeze(0)
+            is_hop = slot >= (self.k_max - k).unsqueeze(1)
+            inputs[:, M + 2 :] = torch.where(is_hop, self.hop, self.sep)
+        else:  # "none"
+            inputs[:, M + 2] = self.sep
         return inputs, cur
 
 
@@ -130,6 +152,44 @@ TRAIN_DEFAULTS = {
     "small": dict(lr=3e-3, warmup=0),
     "big": dict(lr=3e-4, warmup=500),
 }
+
+
+def tie_loops(model: OpenMythos) -> None:
+    """Make every recurrent iteration apply the same function.
+
+    The block normally gets two loop-specific inputs: a sinusoidal loop-index
+    signal and a per-loop LoRA scale. With both it can learn "three different
+    steps" instead of "one step, repeated", and a different step for each
+    trained loop says nothing about loop four. This switches both off.
+    """
+    rec = model.recurrent
+    rec.loop_dim = 0
+    lora_forward = rec.lora.forward
+    rec.lora.forward = lambda x, loop_t: lora_forward(x, 0)
+
+
+def read_last_iterate(model: OpenMythos) -> None:
+    """Make the recurrent block return its final hidden state.
+
+    The block normally returns an ACT-weighted sum of the hidden states from
+    every loop, and a position stops contributing once its halting mass is
+    used up. A model trained on up to three loops can learn to spend all of
+    that mass by loop three; loops four and up then get zero weight and the
+    answer freezes. Reading the last state removes halting from the picture.
+    """
+    from open_mythos.main import loop_index_embedding
+
+    rec = model.recurrent
+
+    def forward(h, e, freqs_cis, mask=None, n_loops=None, kv_cache=None):
+        for t in range(n_loops or rec.cfg.max_loop_iters):
+            combined = loop_index_embedding(rec.norm(h + e), t, rec.loop_dim)
+            out = rec.block(combined, freqs_cis, mask, kv_cache, f"recurrent_loop_{t}")
+            out = out + rec.lora(out, t)
+            h = rec.injection(h, e, out)
+        return h
+
+    rec.forward = forward
 
 
 class LoopCounter:
@@ -189,6 +249,12 @@ def build_parser():
     g.add_argument("--states", type=int, default=6, help="number of states M")
     g.add_argument("--k-train", type=int, default=3, help="max hops seen in training")
     g.add_argument("--k-test", type=int, default=5, help="max hops at evaluation")
+    g.add_argument(
+        "--k-encoding", choices=["token", "unary", "none"], default="token",
+        help="how the hop count reaches the model: one token per k (unseen k has "
+             "an untrained embedding), k copies of a HOP token, or not at all "
+             "(training then runs exactly k loops, so loops = hops)",
+    )
 
     g = ap.add_argument_group("model (defaults come from --preset; any flag overrides)")
     g.add_argument("--preset", choices=sorted(PRESETS), default="small")
@@ -209,6 +275,17 @@ def build_parser():
              "requested loop runs (recommended when probing depth)",
     )
     g.add_argument("--dropout", type=float, default=0.0)
+    g.add_argument(
+        "--readout", choices=["act", "last"], default="act",
+        help="ablation: 'last' returns the hidden state after the final loop "
+             "instead of the ACT-weighted sum over loops (no halting)",
+    )
+    g.add_argument(
+        "--tie-loops", action="store_true",
+        help="ablation: remove everything that tells the recurrent block which "
+             "loop it is on (loop-index signal off, per-loop LoRA scale shared), "
+             "so every loop applies exactly the same function",
+    )
 
     g = ap.add_argument_group("training")
     g.add_argument("--steps", type=int, default=3000)
@@ -294,7 +371,8 @@ def eval_table(model, task, args, loop_sweep, gen, device, counter):
     print("  loops run | " + " | ".join(f"{ran[n]:>4d}" for n in loop_sweep))
     print(f"\n  rows marked * use k values never seen during training (k>{args.k_train})")
     print("  'loops' = recurrent depth requested at inference; training used "
-          f"n_loops={args.train_loops}")
+          f"n_loops={args.train_loops}"
+          + (" (one loop per hop, 1..k_train)" if args.k_encoding == "none" else ""))
     print("  'loops run' = depth actually executed before ACT halted every position")
     return rows
 
@@ -311,7 +389,12 @@ def main():
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(args.seed)
 
-    task = PointerChase(args.states, args.k_test)
+    if args.k_encoding == "none":
+        # loops = hops: the model is trained at 1..k_train loops, and early
+        # halting would break the one-hop-per-loop correspondence.
+        args.train_loops = args.k_train
+        args.act_threshold = 1.0
+    task = PointerChase(args.states, args.k_test, args.k_encoding)
     cfg = make_config(args, task)
     if args.resume:
         model = OpenMythos.from_pretrained(args.resume)
@@ -319,6 +402,10 @@ def main():
     else:
         model = OpenMythos(cfg)
     model.to(device)
+    if args.tie_loops:
+        tie_loops(model)
+    if args.readout == "last":
+        read_last_iterate(model)
     counter = LoopCounter(model)
 
     print(
@@ -335,7 +422,11 @@ def main():
         f"lr={args.lr:g}  warmup={args.warmup}\n"
     )
 
-    loop_sweep = args.eval_loops or [1, 2, args.train_loops, args.train_loops * 2]
+    if args.k_encoding == "none":
+        default_sweep = list(range(1, args.k_test + 2))
+    else:
+        default_sweep = [1, 2, args.train_loops, args.train_loops * 2]
+    loop_sweep = args.eval_loops or default_sweep
     train_ks = list(range(1, args.k_train + 1))
     history = []
 
@@ -350,9 +441,16 @@ def main():
             if args.warmup and step <= args.warmup:
                 for pg in opt.param_groups:
                     pg["lr"] = args.lr * step / args.warmup
-            x, y = task.batch(args.batch, train_ks, gen)
+            if args.k_encoding == "none":
+                # loops = hops: one k per batch, run exactly k loops
+                k_step = train_ks[int(torch.randint(0, len(train_ks), (1,), generator=gen))]
+                x, y = task.batch(args.batch, [k_step], gen)
+                step_loops = k_step
+            else:
+                x, y = task.batch(args.batch, train_ks, gen)
+                step_loops = args.train_loops
             x, y = x.to(device), y.to(device)
-            logits = model(x, n_loops=args.train_loops)[:, -1, :]
+            logits = model(x, n_loops=step_loops)[:, -1, :]
             loss = F.cross_entropy(logits, y)
             opt.zero_grad()
             loss.backward()
@@ -383,6 +481,10 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     model.save_pretrained(save_dir)
     reloaded = OpenMythos.from_pretrained(save_dir).to(device)
+    if args.tie_loops:
+        tie_loops(reloaded)
+    if args.readout == "last":
+        read_last_iterate(reloaded)
     x, _ = task.batch(64, [args.k_train], gen)
     x = x.to(device)
     with torch.no_grad():
