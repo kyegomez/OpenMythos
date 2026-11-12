@@ -425,7 +425,11 @@ def main():
     # Hyperparameters
     # ------------------------------------------------------------------
     seq_len = 2048
-    micro_batch = 4
+    # Sequences per GPU per forward pass. Measured on 2x A100 80GB at 2048 tokens:
+    # 1 fits (67.9 GiB peak per GPU with gradient accumulation); 2 and 4 run out
+    # of memory. grad_accum below keeps the global batch the same, so raise this
+    # only on larger cards.
+    micro_batch = 1
     target_tokens = 30_000_000_000
     grad_accum = max(1, 256 // (world_size * micro_batch))
     global_batch_tok = world_size * micro_batch * grad_accum * seq_len
