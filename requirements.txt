@@ -1,6 +1,14 @@
 torch>=2.1.0
+safetensors>=0.4.0
+numpy>=1.24  # safetensors.torch needs it; CPU-only torch wheels do not pull it in
+
+# optional — only needed for MythosTokenizer (HuggingFace) and the training script.
+# The core model (open_mythos.main) runs on torch alone.
 transformers>=4.40.0
 datasets>=2.18.0
+loguru>=0.7.0
+
+# dev
 pytest>=7.0.0
 
 # optional — enables Flash Attention 2 in GQAttention (requires CUDA + build tools)

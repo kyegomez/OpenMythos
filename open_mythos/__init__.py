@@ -15,7 +15,6 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
-from open_mythos.tokenizer import MythosTokenizer
 from open_mythos.variants import (
     mythos_1b,
     mythos_1t,
@@ -49,7 +48,20 @@ __all__ = [
     "mythos_100b",
     "mythos_500b",
     "mythos_1t",
-    "load_tokenizer",
-    "get_vocab_size",
     "MythosTokenizer",
 ]
+
+
+def __getattr__(name: str):
+    """Lazily import the tokenizer so the core model works without `transformers`.
+
+    MythosTokenizer wraps a HuggingFace AutoTokenizer, pulling in the heavy
+    `transformers` dependency. Importing it lazily (PEP 562) means
+    `import open_mythos` and the model classes stay usable in environments that
+    only install torch.
+    """
+    if name == "MythosTokenizer":
+        from open_mythos.tokenizer import MythosTokenizer
+
+        return MythosTokenizer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+import json
+import os
+from dataclasses import asdict, dataclass, fields
 from typing import Optional
 
 import torch
@@ -44,6 +46,17 @@ class MythosConfig:
 
     Other:
         act_threshold   -- ACT halting threshold (cumulative probability to stop looping)
+        act_final_remainder -- give each still-running position's unused halting
+                           mass to the last loop that runs, as in Graves' ACT, so
+                           the loop weights always sum to 1. Off, a position that
+                           has not halted when the loops end simply loses that
+                           mass, which pushes training to halt by the deepest
+                           trained loop and blocks deeper inference (see
+                           examples/depth_extrapolation.py).
+        act_early_exit  -- stop looping once every position has halted. Turn off under
+                           FSDP/DDP training: the loop count then depends on each
+                           rank's data, ranks issue different numbers of collectives,
+                           and the run deadlocks. The output is the same either way.
         rope_theta      -- RoPE base frequency
         lora_rank       -- rank of the per-loop depth-wise LoRA adapter
     """
@@ -71,10 +84,15 @@ class MythosConfig:
     expert_dim: int = 512  # fine-grained: dim // (n_experts // n_experts_per_tok)
     # ACT halting
     act_threshold: float = 0.99
+    act_early_exit: bool = True
+    act_final_remainder: bool = False
     # RoPE
     rope_theta: float = 500000.0
     # LoRA depth adaptation
     lora_rank: int = 16
+    # MoE aux-loss-free load balancing: step size for the per-expert router
+    # bias update (DeepSeek-V3). 0.0 disables balancing and freezes the bias.
+    router_bias_update_rate: float = 1e-3
     # Maximum tokens to generate per forward pass
     max_output_tokens: int = 4096
     # Dropout (set 0.0 to disable; 0.1 is standard for pretraining)
@@ -242,7 +260,10 @@ class GQAttention(nn.Module):
                 v = torch.cat([kv_cache[cache_key]["v"], v], dim=1)
             kv_cache[cache_key] = {"k": k.detach(), "v": v.detach()}
 
-        if _HAS_FLASH_ATTN:
+        if _HAS_FLASH_ATTN and q.is_cuda:
+            # flash_attn_func is CUDA-only; a CPU model (or a CPU unit test on a
+            # machine that happens to have flash-attn installed) takes the
+            # fallback below.
             # flash_attn_func expects (B, T, H, head_dim) — GQA is handled natively
             # (n_kv_heads < n_heads is supported without repeat_interleave).
             # causal=True when mask is present (full-sequence prefill/training);
@@ -378,15 +399,14 @@ class MLAttention(nn.Module):
         # KV compress
         kv_raw = self.kv_down(x)
         c_kv = kv_raw[..., : self.kv_lora_rank]  # (B, T, lora_rank)  ← cached
-        k_rope = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim)
-        # expand rope keys across heads and apply RoPE before caching so
-        # retrieved keys are already positionally encoded
-        k_rope = (
-            k_rope.unsqueeze(2)
-            .expand(B, T, self.n_heads, self.qk_rope_dim)
-            .contiguous()
-        )
-        k_rope = apply_rope(k_rope, freqs_cis)  # (B, T, H, rope_dim) ← cached
+        k_rope = kv_raw[..., self.kv_lora_rank :]  # (B, T, rope_dim) — shared across heads
+        # Apply RoPE once (head axis = 1) before caching so retrieved keys are
+        # already positionally encoded. Every head uses the *same* RoPE key, so
+        # cache the single shared (B, T, rope_dim) tensor and expand it across
+        # heads only at read time. This keeps the MLA cache at
+        # kv_lora_rank + rope_dim per token instead of replicating rope_dim
+        # across all n_heads — the whole point of compressing the KV path.
+        k_rope = apply_rope(k_rope.unsqueeze(2), freqs_cis).squeeze(2)  # (B, T, rope_dim)
 
         if kv_cache is not None:
             if cache_key in kv_cache:
@@ -401,7 +421,9 @@ class MLAttention(nn.Module):
         kv = kv.view(B, S, self.n_heads, self.qk_nope_dim + self.v_dim)
         k_nope = kv[..., : self.qk_nope_dim]  # (B, S, H, nope)
         v = kv[..., self.qk_nope_dim :]  # (B, S, H, v_dim)
-        k = torch.cat([k_nope, k_rope], dim=-1)  # (B, S, H, nope+rope)
+        # expand the shared RoPE keys across heads for per-head attention
+        k_rope_full = k_rope.unsqueeze(2).expand(B, S, self.n_heads, self.qk_rope_dim)
+        k = torch.cat([k_nope, k_rope_full], dim=-1)  # (B, S, H, nope+rope)
 
         # attention
         q = q.transpose(1, 2)  # (B, H, T, q_head_dim)
@@ -479,10 +501,14 @@ class MoEFFN(nn.Module):
         self.n_experts = cfg.n_experts
         self.n_shared = cfg.n_shared_experts
         self.topk = cfg.n_experts_per_tok
+        self.bias_update_rate = cfg.router_bias_update_rate
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
         # load-balancing bias adjusted externally during training; not a gradient param
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        # running token count per expert since the last bias update; used by
+        # update_bias() to nudge the router toward balanced load. Not trained.
+        self.register_buffer("expert_load", torch.zeros(cfg.n_experts))
 
         self.routed_experts = nn.ModuleList(
             [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
@@ -511,26 +537,54 @@ class MoEFFN(nn.Module):
         # never shows up in the gradient.
         logits = self.router(flat)  # (B*T, n_experts), unbiased
         scores = F.softmax(logits, dim=-1)
-        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)
+        _, topk_idx = (logits + self.router_bias).topk(self.topk, dim=-1)  # (N, K)
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
-        # routed expert dispatch (token-level scatter)
+        # Routed dispatch: one pass over experts (not topk × experts). For each
+        # expert, gather every (token, slot) pair that selected it — identical
+        # math to the per-slot scatter but O(n_experts) Python iterations.
         out = torch.zeros_like(flat)
-        for i in range(self.topk):
-            expert_ids = topk_idx[:, i]
-            token_scores = topk_scores[:, i].unsqueeze(-1)
-            for eid in range(self.n_experts):
-                mask = expert_ids == eid
-                if not mask.any():
-                    continue
-                out[mask] += token_scores[mask] * self.routed_experts[eid](flat[mask])
+        for eid in range(self.n_experts):
+            tok_idx, slot = torch.where(topk_idx == eid)
+            if tok_idx.numel() == 0:
+                continue
+            w = topk_scores[tok_idx, slot].unsqueeze(-1)
+            out[tok_idx] += w * self.routed_experts[eid](flat[tok_idx])
+
+        # Track per-expert load for aux-loss-free balancing (training only).
+        if self.training and self.bias_update_rate > 0.0:
+            with torch.no_grad():
+                self.expert_load += torch.bincount(
+                    topk_idx.flatten(), minlength=self.n_experts
+                ).to(self.expert_load.dtype)
 
         # shared experts always fire for every token
         for shared in self.shared_experts:
             out = out + shared(flat)
 
         return out.view(B, T, D)
+
+    @torch.no_grad()
+    def update_bias(self) -> None:
+        """
+        Apply one aux-loss-free load-balancing step to router_bias (DeepSeek-V3).
+
+        Experts that received more than the average load since the last call
+        have their routing bias decreased; under-loaded experts have it
+        increased. The update is a fixed-magnitude sign step, so it never
+        touches the gating weights (which come from unbiased softmax scores)
+        and therefore never enters the gradient. Resets the load counter.
+
+        Call once per optimizer step from the training loop. No-op when
+        router_bias_update_rate is 0 or no tokens have been routed yet.
+        """
+        if self.bias_update_rate <= 0.0 or self.expert_load.sum() == 0:
+            return
+        mean_load = self.expert_load.mean()
+        err = mean_load - self.expert_load  # >0: under-loaded, <0: over-loaded
+        self.router_bias += self.bias_update_rate * torch.sign(err)
+        self.expert_load.zero_()
 
 
 # ---------------------------------------------------------------------------
@@ -722,7 +776,12 @@ class LTIInjection(nn.Module):
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
         # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        A = torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        # Guard the strict ρ(A) < 1 guarantee against float rounding: for a very
+        # negative exponent, exp(-exp(x)) is mathematically just below 1 but
+        # rounds up to exactly 1.0 at the dtype's precision, which would break
+        # stability. Cap one ULP below 1 so the spectral radius is always < 1.
+        return A.clamp(max=1.0 - torch.finfo(A.dtype).eps)
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
@@ -851,18 +910,25 @@ class RecurrentBlock(nn.Module):
         B, T, D = h.shape
 
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
-        cumulative_p = torch.zeros(B, T, device=h.device)
+        # Halting bookkeeping stays in float32 whatever the activation dtype:
+        # bf16/fp16 cannot accumulate probabilities against a 0.99 threshold
+        # accurately, and mixing a float32 weight into h would silently promote
+        # the whole residual stream to float32 in a half-precision model.
+        cumulative_p = torch.zeros(B, T, device=h.device, dtype=torch.float32)
         h_out = torch.zeros_like(h)
 
         for t in range(n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
-            combined = self.norm(h_loop + e)
+            # Normalize first, then add the loop-index signal. The signal has
+            # O(1) magnitude; added before the norm it swamps a freshly
+            # initialized hidden state (RMS ~0.02), making every token look
+            # the same to attention and collapsing MoE routing onto two experts.
+            combined = loop_index_embedding(self.norm(h + e), t, self.loop_dim)
             cache_key = f"recurrent_loop_{t}"
             trans_out = self.block(combined, freqs_cis, mask, kv_cache, cache_key)
             trans_out = trans_out + self.lora(trans_out, t)
             h = self.injection(h, e, trans_out)
 
-            p = self.act(h)  # (B, T)
+            p = self.act(h).float()  # (B, T), float32 for the halting math
             still_running = ~halted
 
             # ACT remainder trick: once cumulative_p + p crosses threshold,
@@ -871,13 +937,13 @@ class RecurrentBlock(nn.Module):
             # once (on the halting step) and zero thereafter — otherwise
             # threshold<1 leaves a non-zero remainder that leaks every step.
             remainder = (1.0 - cumulative_p).clamp(min=0)
-            weight = torch.where(
-                cumulative_p + p >= self.cfg.act_threshold,
-                remainder,
-                p,
-            )
+            takes_remainder = cumulative_p + p >= self.cfg.act_threshold
+            if self.cfg.act_final_remainder and t == n_loops - 1:
+                # Last loop that will run: whatever mass is left goes here.
+                takes_remainder = torch.ones_like(takes_remainder)
+            weight = torch.where(takes_remainder, remainder, p)
             weight = weight * still_running.float()
-            h_out = h_out + weight.unsqueeze(-1) * h
+            h_out = h_out + weight.unsqueeze(-1).to(h.dtype) * h
 
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
@@ -885,7 +951,7 @@ class RecurrentBlock(nn.Module):
             # Only short-circuit when there is no KV cache to keep consistent.
             # With a cache, every loop depth must run on every forward pass so
             # later decode steps find populated keys at every cache_key.
-            if halted.all() and kv_cache is None:
+            if self.cfg.act_early_exit and halted.all() and kv_cache is None:
                 break
 
         return h_out
@@ -957,6 +1023,26 @@ class OpenMythos(nn.Module):
 
         self._init_weights()
 
+    _ROPE_BUFFERS = ("freqs_cis", "freqs_cis_mla")
+
+    def _apply(self, fn, *args, **kwargs):
+        """
+        Keep the RoPE tables complex when the model is cast to another dtype.
+
+        ``Module.to(dtype=...)`` casts complex buffers to the real target dtype
+        and drops the imaginary part, which silently turns every RoPE rotation
+        into a plain rescale. ``apply_rope`` always works in complex64 and
+        returns the caller's dtype, so the tables only ever need to follow the
+        model's device, never its dtype.
+        """
+        saved = {n: self._buffers.get(n) for n in self._ROPE_BUFFERS}
+        out = super()._apply(fn, *args, **kwargs)
+        for name, old in saved.items():
+            new = self._buffers.get(name)
+            if old is not None and new is not None and not new.is_complex():
+                self._buffers[name] = old.to(new.device)
+        return out
+
     def _init_weights(self) -> None:
         """Initialize all linear and embedding weights with N(0, 0.02)."""
         for m in self.modules():
@@ -1013,8 +1099,27 @@ class OpenMythos(nn.Module):
         Returns:
             Logits of shape (B, T, vocab_size)
         """
+        if input_ids.dim() != 2:
+            raise ValueError(
+                f"input_ids must be 2-D (B, T); got shape {tuple(input_ids.shape)}"
+            )
         T = input_ids.shape[1]
         device = input_ids.device
+
+        # Position bound: RoPE frequencies are only precomputed up to max_seq_len.
+        if start_pos + T > self.cfg.max_seq_len:
+            raise ValueError(
+                f"sequence position {start_pos + T} exceeds max_seq_len="
+                f"{self.cfg.max_seq_len}"
+            )
+        # Token-id bound: an out-of-range id is an out-of-bounds embedding lookup.
+        # Validate explicitly so it raises here instead of reading bad memory or
+        # crashing deep in the embedding kernel — the first thing to harden if
+        # this model is ever put behind an inference endpoint.
+        if ((input_ids < 0) | (input_ids >= self.cfg.vocab_size)).any():
+            raise ValueError(
+                f"input_ids contains values outside [0, {self.cfg.vocab_size})"
+            )
 
         x = self.embed(input_ids)
         freqs_cis = (
@@ -1083,3 +1188,102 @@ class OpenMythos(nn.Module):
             next_tok = torch.multinomial(probs, num_samples=1)
             input_ids = torch.cat([input_ids, next_tok], dim=1)
         return input_ids
+
+    def update_router_bias(self) -> None:
+        """
+        Apply one aux-loss-free load-balancing step to every MoE layer.
+
+        Call once per optimizer step, after optimizer.step(), so the router
+        bias tracks real expert load across training. No-op at inference or
+        when router_bias_update_rate is 0.
+        """
+        for m in self.modules():
+            if isinstance(m, MoEFFN):
+                m.update_bias()
+
+    def num_parameters(self, trainable_only: bool = False) -> int:
+        """
+        Count scalar parameters in the model.
+
+        Args:
+            trainable_only -- if True, count only parameters with requires_grad
+
+        Returns:
+            Total parameter count. Note the LM head and embedding are tied, so
+            they are counted once.
+        """
+        seen: set[int] = set()
+        total = 0
+        for p in self.parameters():
+            if trainable_only and not p.requires_grad:
+                continue
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            total += p.numel()
+        return total
+
+    def save_pretrained(self, save_dir: str) -> None:
+        """
+        Save config and weights to a directory using safetensors (no pickle).
+
+        Writes two files: ``config.json`` (the MythosConfig fields) and
+        ``model.safetensors`` (the state dict). safetensors is a pure-tensor
+        format with no code execution on load, unlike ``torch.save``/pickle,
+        which can run arbitrary code when a malicious checkpoint is opened.
+
+        Args:
+            save_dir -- directory to create and write into
+        """
+        try:
+            from safetensors.torch import save_file
+        except ImportError as e:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "save_pretrained requires the 'safetensors' package "
+                "(pip install safetensors)."
+            ) from e
+
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, "config.json"), "w") as f:
+            json.dump(asdict(self.cfg), f, indent=2)
+        # Tied weights share storage; safetensors rejects shared tensors, so
+        # drop the head copy and restore it from the embedding on load.
+        state = {k: v for k, v in self.state_dict().items() if k != "head.weight"}
+        state = {k: v.contiguous() for k, v in state.items()}
+        save_file(state, os.path.join(save_dir, "model.safetensors"))
+
+    @classmethod
+    def from_pretrained(cls, save_dir: str, device: str = "cpu") -> "OpenMythos":
+        """
+        Load a model saved with :meth:`save_pretrained`.
+
+        Reads ``config.json`` and ``model.safetensors`` only. Never calls
+        ``torch.load``/pickle, so loading an untrusted checkpoint directory
+        cannot execute code.
+
+        Args:
+            save_dir -- directory written by save_pretrained
+            device   -- device to map tensors onto
+
+        Returns:
+            An OpenMythos instance with the saved weights loaded.
+        """
+        try:
+            from safetensors.torch import load_file
+        except ImportError as e:  # pragma: no cover - optional dependency
+            raise ImportError(
+                "from_pretrained requires the 'safetensors' package "
+                "(pip install safetensors)."
+            ) from e
+
+        with open(os.path.join(save_dir, "config.json")) as f:
+            raw = json.load(f)
+        # Ignore unknown keys so a checkpoint from a newer config still loads.
+        known = {f.name for f in fields(MythosConfig)}
+        cfg = MythosConfig(**{k: v for k, v in raw.items() if k in known})
+
+        model = cls(cfg).to(device)
+        state = load_file(os.path.join(save_dir, "model.safetensors"), device=device)
+        state["head.weight"] = state["embed.weight"]  # restore tied weight
+        model.load_state_dict(state)
+        return model

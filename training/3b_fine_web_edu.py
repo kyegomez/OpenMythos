@@ -26,11 +26,12 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.utils.data import IterableDataset, DataLoader, get_worker_info
 from contextlib import nullcontext
+from dataclasses import asdict, is_dataclass
 
 from datasets import load_dataset
 
 from open_mythos import OpenMythos
-from open_mythos.main import TransformerBlock, RecurrentBlock
+from open_mythos.main import MoEFFN, TransformerBlock, RecurrentBlock
 from open_mythos.variants import mythos_3b
 from open_mythos.tokenizer import MythosTokenizer
 
@@ -38,6 +39,33 @@ from open_mythos.tokenizer import MythosTokenizer
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+
+def shard_stream(ds, total_shards: int, shard_index: int):
+    """
+    Give one `(rank, worker)` consumer its own disjoint slice of a streaming dataset.
+
+    `IterableDataset.shard` splits by source file, so it only works while there
+    are at least as many files as consumers; past that it raises IndexError
+    (e.g. 4 GPUs x 4 workers = 16 consumers on a subset with fewer files).
+    In that case fall back to splitting by document: every consumer reads the
+    whole stream and keeps each `total_shards`-th document. Coverage stays
+    disjoint and complete; the cost is that skipped documents are still read.
+
+    Args:
+        ds           -- streaming dataset (iterable of samples)
+        total_shards -- number of consumers, world_size * num_workers
+        shard_index  -- this consumer's index in [0, total_shards)
+
+    Returns:
+        An iterable over this consumer's samples.
+    """
+    n_files = getattr(ds, "num_shards", None) or getattr(ds, "n_shards", None)
+    if n_files is not None and n_files >= total_shards:
+        return ds.shard(num_shards=total_shards, index=shard_index)
+    return (
+        sample for i, sample in enumerate(ds) if i % total_shards == shard_index
+    )
 
 
 class FineWebEduDataset(IterableDataset):
@@ -49,6 +77,8 @@ class FineWebEduDataset(IterableDataset):
     `world_size` ranks × `num_workers` DataLoader workers per rank — and each
     `(rank, worker_id)` deterministically owns one shard of the global stream.
     That gives disjoint coverage without any cross-process coordination.
+    When there are more consumers than source files the split falls back from
+    per-file to per-document (see `shard_stream`).
 
     Streaming datasets are not seekable, so a resumed run re-enters its shard
     from the beginning. Acceptable at pretraining scale: the chance of
@@ -89,12 +119,16 @@ class FineWebEduDataset(IterableDataset):
         total_shards = self.world_size * num_workers
         shard_index = self.rank * num_workers + worker_id
 
-        ds = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name=self.subset,
-            split="train",
-            streaming=True,
-        ).shard(num_shards=total_shards, index=shard_index)
+        ds = shard_stream(
+            load_dataset(
+                "HuggingFaceFW/fineweb-edu",
+                name=self.subset,
+                split="train",
+                streaming=True,
+            ),
+            total_shards,
+            shard_index,
+        )
 
         buf = []
         for sample in ds:
@@ -240,7 +274,9 @@ def save_checkpoint(
             "step": step,
             "model": model_state,
             "optimizer": optim_state,
-            "cfg": cfg,
+            # Plain dict, not the dataclass: keeps the file loadable with
+            # weights_only=True (no arbitrary pickle on resume).
+            "cfg": asdict(cfg) if is_dataclass(cfg) else cfg,
             "vocab_size": vocab_size,
         },
         tmp_path,
@@ -256,6 +292,23 @@ def save_checkpoint(
     logger.success(f"Checkpoint saved → {final_path}")
 
 
+@torch.no_grad()
+def update_router_bias(model, ddp: bool) -> None:
+    """
+    Run the aux-loss-free MoE load-balancing step after an optimizer step.
+
+    Without this the router bias never moves and routing is free to collapse
+    onto a few experts. Under FSDP each rank only counts its own tokens, so the
+    per-expert load is summed across ranks first; every rank then applies the
+    same update and the bias buffers stay identical everywhere.
+    """
+    for m in model.modules():
+        if isinstance(m, MoEFFN):
+            if ddp:
+                dist.all_reduce(m.expert_load, op=dist.ReduceOp.SUM)
+            m.update_bias()
+
+
 def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
     """
     Restore model + optimizer from disk, returning the step to resume at.
@@ -266,9 +319,9 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
     and optimizer loads across two `state_dict_type` blocks has historically
     produced optimizer state bound to the wrong shard shapes.
 
-    `weights_only=False` is required because the checkpoint contains the
-    pickled `cfg` dataclass — flip to `weights_only=True` only if you
-    separate config out.
+    Loaded with `weights_only=True`: the checkpoint holds only tensors and
+    plain Python containers (the config is saved as a dict), so resuming never
+    unpickles arbitrary objects.
 
     Args:
         model     -- same FSDP-wrapped or raw model used during save
@@ -281,7 +334,7 @@ def load_checkpoint(model, optimizer, path: str, ddp: bool) -> int:
         The step number the checkpoint was taken at; the caller advances the
         training loop from this value.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
 
     if ddp:
         with FSDP.state_dict_type(
@@ -372,7 +425,11 @@ def main():
     # Hyperparameters
     # ------------------------------------------------------------------
     seq_len = 2048
-    micro_batch = 4
+    # Sequences per GPU per forward pass. Measured on 2x A100 80GB at 2048 tokens:
+    # 1 fits (67.9 GiB peak per GPU with gradient accumulation); 2 and 4 run out
+    # of memory. grad_accum below keeps the global batch the same, so raise this
+    # only on larger cards.
+    micro_batch = 1
     target_tokens = 30_000_000_000
     grad_accum = max(1, 256 // (world_size * micro_batch))
     global_batch_tok = world_size * micro_batch * grad_accum * seq_len
@@ -404,6 +461,11 @@ def main():
     model = OpenMythos(cfg)
 
     if ddp:
+        # Each rank must run the same number of loop iterations: the block
+        # inside the recurrent loop is its own FSDP unit and all-gathers its
+        # weights on every iteration, so a rank that halts early stops
+        # answering collectives and the other rank hangs.
+        cfg.act_early_exit = False
         mp_policy = MixedPrecision(
             param_dtype=amp_dtype,
             reduce_dtype=amp_dtype,
@@ -513,6 +575,7 @@ def main():
         else:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        update_router_bias(model, ddp)
         step += 1
 
         if master and step % log_every == 0:

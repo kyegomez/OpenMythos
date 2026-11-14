@@ -46,6 +46,18 @@ To enable Flash Attention 2 in `GQAttention` (requires CUDA and build tools):
 pip install open-mythos[flash]
 ```
 
+To work from a clone of this repository instead (runs the tests and the scripts in `examples/` against the code you have checked out):
+
+```bash
+git clone https://github.com/kyegomez/OpenMythos.git
+cd OpenMythos
+python -m venv .venv && source .venv/bin/activate
+# CPU-only machines: install the small CPU build of torch first
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+python -m pytest -q
+```
+
 ## Usage
 
 ```python
@@ -96,14 +108,50 @@ print(f"[{attn_type.upper()}] Logits shape: {logits.shape}")
 out = model.generate(ids, max_new_tokens=8, n_loops=8)
 print(f"[{attn_type.upper()}] Generated shape: {out.shape}")
 
+# get_A() returns the diagonal of the (diagonal) state matrix, so its entries
+# ARE the eigenvalues — the spectral radius is just their max magnitude.
 A = model.recurrent.injection.get_A()
-rho = torch.linalg.eigvals(A).abs().max().item()
+rho = A.abs().max().item()
 print(
     f"[{attn_type.upper()}] Spectral radius ρ(A) = {rho:.4f} (must be < 1)"
 )
 ```
 
 
+
+## Saving and loading
+
+Checkpoints use [safetensors](https://github.com/huggingface/safetensors), not `torch.save`/pickle, so loading a checkpoint never executes code:
+
+```python
+model.save_pretrained("ckpt/")           # writes config.json + model.safetensors
+model = OpenMythos.from_pretrained("ckpt/")
+```
+
+`forward` validates its inputs: token ids outside `[0, vocab_size)` and positions beyond `max_seq_len` raise a clear `ValueError` instead of reading out of bounds. The core model imports only `torch`; `transformers` is pulled in lazily and only by `MythosTokenizer`.
+
+## Does the looping actually do anything?
+
+The whole premise is that more loop iterations buy more reasoning. [`examples/depth_extrapolation.py`](examples/depth_extrapolation.py) tests this directly: it trains a small model on iterated pointer-chasing (compute `P^k(s)` for a fresh random permutation each example, which cannot be memorized and needs `k` sequential steps), then reports accuracy as a function of the inference loop count, including hop counts never seen in training.
+
+```bash
+python examples/depth_extrapolation.py
+```
+
+The table it prints ends with a `loops run` row: the recurrent depth the model *actually* executed before ACT halted every position. If that row stays at 1 while you request 6 or 12 loops, the halting head is cutting the computation short and the accuracy columns cannot differ; pass `--act-threshold 1.0` to force every requested loop to run.
+
+The small default (271k params) proves the pipeline on a laptop CPU but is too small to show the depth effect. For a real attempt on a GPU box:
+
+```bash
+python examples/depth_extrapolation.py --preset big --device cuda \
+    --states 12 --k-train 4 --k-test 8 --train-loops 8 \
+    --act-threshold 1.0 --steps 40000 --batch 256 \
+    --eval-loops 1 2 4 8 16 --eval-every 5000 --save-dir runs/depth_big
+```
+
+`--preset big` (about 13M params) sets model-size defaults plus a matching learning rate and warmup (`--lr 3e-4 --warmup 500`; the small preset's 3e-3 leaves the big model at chance). `--dim`, `--experts`, `--lora-rank`, `--prelude`, `--coda`, `--lr`, `--warmup` and friends override any of them. `--save-dir` writes the safetensors checkpoint plus a `results.json` with the loss history and the full accuracy table, and `--resume DIR` re-evaluates a saved model without retraining. See `--help` for the full list.
+
+During training it also calls `model.update_router_bias()` each step, which applies the DeepSeek-V3 aux-loss-free load-balancing update to the MoE router so experts stay balanced.
 
 ## Model Variants
 
@@ -121,11 +169,10 @@ from open_mythos import (
     OpenMythos,
 )
 
-cfg = mythos_7b()  # returns a MythosConfig
+cfg = mythos_3b()  # returns a MythosConfig
 model = OpenMythos(cfg)
 
-total = sum(p.numel() for p in model.parameters())
-print(f"Parameters: {total:,}")
+print(f"Parameters: {model.num_parameters():,}")
 ```
 
 | Variant | `dim` | Experts | `expert_dim` | Loop iters | Context | Max output |
