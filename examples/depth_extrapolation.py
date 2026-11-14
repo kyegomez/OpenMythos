@@ -50,13 +50,17 @@ that go with them; every value can still be overridden by its own flag. See READ
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 
 import torch
 import torch.nn.functional as F
 
-from open_mythos.main import MythosConfig, OpenMythos
+# Run from a plain clone without installing the package.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from open_mythos.main import MythosConfig, OpenMythos  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

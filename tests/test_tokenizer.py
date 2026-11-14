@@ -1,5 +1,8 @@
 import pytest
-from open_mythos.tokenizer import MythosTokenizer
+
+pytest.importorskip("transformers")  # optional dependency
+
+from open_mythos.tokenizer import MythosTokenizer  # noqa: E402
 
 
 @pytest.fixture(scope="module")
