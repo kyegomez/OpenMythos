@@ -46,6 +46,18 @@ To enable Flash Attention 2 in `GQAttention` (requires CUDA and build tools):
 pip install open-mythos[flash]
 ```
 
+To work from a clone of this repository instead (runs the tests and the scripts in `examples/` against the code you have checked out):
+
+```bash
+git clone https://github.com/kyegomez/OpenMythos.git
+cd OpenMythos
+python -m venv .venv && source .venv/bin/activate
+# CPU-only machines: install the small CPU build of torch first
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+python -m pytest -q
+```
+
 ## Usage
 
 ```python
